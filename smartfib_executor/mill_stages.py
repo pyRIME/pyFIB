@@ -189,6 +189,11 @@ def reference_for_stage(rec, stage: str, base_dir) -> Tuple[Optional[Path], str,
     label = f"{STAGE_LABEL[prev]} after image"
     if p is None:
         return None, label, f"no {label}"
+    # v0.53.1: an after image recorded at the wrong magnification is never a reference.
+    from .after_image import meta_problem
+    bad = meta_problem(p, rec)
+    if bad:
+        return None, label, f"the {label} {p.name} {bad}"
     return p, f"{label} {p.name}", None
 
 

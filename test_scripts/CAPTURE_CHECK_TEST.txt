@@ -1,0 +1,20 @@
+CAPTURE: NEW FRAME AT THE RIGHT MAGNIFICATION (pyFIB v0.53.4)              about 5 min
+==============================================================================
+Why: position_1's 800x file was an exact copy of its 2000x image (the scan never
+restarted for the 800x frame). Capture now reads the magnification back, makes sure the
+scan really restarts, and refuses a copy.
+
+1) RE-CAPTURE position_1 (Go to position_1, then Capture with the same name, 800x on).
+   Expect in the Log:
+     [capture] FIB magnification 2000x (read back 2000x; was ...x)
+     [capture] coarse: FIB magnification 800x (read back 800x)
+     Coarse image (800x): images\position_1_coarse.bmp
+   Open position_1_coarse.bmp: it must show the wider field (as position_2's does).
+
+2) A FEW MORE CAPTURES as usual. If you ever see:
+     "the scan still reads Frozen 2 s after the unfreeze; sending it again"
+     "coarse frame is not a new frame ... trying once more"
+     "WARNING: coarse reference at 800x FAILED: ..."  (the 2000x capture is kept)
+     "FIB magnification reads ...x after setting 2000x ... capture refused"
+   send those lines and say what the microscope was doing just before (just started,
+   after a mill, after SEM imaging ...). That tells us what state causes it.

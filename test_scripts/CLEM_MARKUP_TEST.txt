@@ -1,0 +1,69 @@
+CLEM PART 2: MARK TARGETS WITH THE MARKUP TRENCHES (pyFIB v0.53.0)        about 20 min
+==============================================================================
+
+What is new
+  * Correlation tab, card 4 "Mark targets". Tick targets; pyFIB writes ONE SmartFIB
+    layout with Markup_Standard on every ticked target (the tick = the lamella: midway
+    between the trenches, at the tick's height), placed on the FIB overview, and mills
+    it at the overview's position and magnification. THE STAGE NEVER MOVES.
+  * It refuses unless the stage still reads the overview's position (X/Y/Z within 1 um,
+    T/R within 0.05 deg), SEM normal, not milling, scan rotation 0. Then it zeroes the
+    beam shift, sets the overview magnification (read back) and objective, mills,
+    and grabs one after image.
+  * Edit in ELYMaker: the layout over the overview with the targets drawn in (yellow =
+    marked, grey = not ticked, red = refused). A saved edit is milled as saved; Reset
+    markup regenerates it.
+
+Needs: a FIB overview (CLEM_OVERVIEW_TEST step 4) and a pyMap targets file for it.
+DO NOT touch the stage (or Z / coincidence) between the FIB overview and the markup:
+the markup is placed on the overview image. If it moved, take a new overview.
+
+Stop and send the Log text if anything moves.
+
+
+1) DRY RUN, ARM OFF                                                       3 min
+   Correlation tab -> Targets table: OK targets are ticked in "Mark", warnings are not.
+   The Markup column reads "will mark" (or "refused: ..." with the reason).
+   Check markup -> the Log prints the plan ("CLEM-MARKUP-PLAN: marked=N ...") and
+   "[DRY RUN]". The card says "N markup(s) on clem_ov_... at 400x · probe 30kV:1.5nA".
+
+
+2) LOOK AT IT IN ELYMAKER                                                 3 min
+   Edit in ELYMaker. Check on 2-3 targets: the yellow cross sits midway between the two
+   trenches, at the height of the tick on the RIGHT trench. Nothing near a field edge.
+   Go back to Correlation WITHOUT saving (it stays "generated").
+
+
+3) MILL ONE SACRIFICIAL MARKUP, ARM ON                                    8 min
+   Untick everything (Mark: None) and tick ONE target in an area you can spare (or add
+   a dummy target on bare ice in pyMap). Mill markup -> read the dialog -> Yes.
+   Expect in the Log, in order:
+     [site] checking that SmartSEM is not milling (5 s)
+     [markup] stage at clem_ov_... ; it is not moved.
+     [markup] zeroing the FIB beam shift ...
+     [markup] FIB 400x (read back 400), objective ... V
+     [markup] milling clem_ov_..._markup_<time>.ely: markups on T.. (3 shapes, generated)
+     ... SmartFIB load / prepare / start, "[confirm] Completion confirmed."
+     [markup] after image images/clem_ov_..._markup_after_<time>.bmp
+     CLEM-MARKUP: milled 1 ...
+   Note the milling time.
+
+
+4) MEASURE THE PLACEMENT (the number that matters)                        4 min
+   Open the after image (session\clem\images\clem_ov_..._markup_after_*.bmp) next to
+   session\clem\markup\clem_ov_..._targets.png (same size; the target cross is drawn).
+   At the target's cross position in the after image: is the point midway between the
+   two new trenches, at the tick's height? Estimate the offset in pixels (1 px = 0.28 um
+   at 400x; the trenches are about 100 px apart centre to centre).
+   Please send: the offset (right/left, up/down, in px), the Log, and
+   session\clem\pyfib_clem_markups.json.
+
+
+5) THE REST
+   If step 4 is within ~1-2 px: tick the real targets and Mill markup (one layout for
+   all of them).
+
+
+Optional: an edit. Edit in ELYMaker, nudge one markup, Save, back to Correlation -> the
+card says "edited in ELYMaker: milled as saved" and the ticks are locked. Reset markup
+-> asks first, then regenerates.

@@ -30,9 +30,10 @@ Design notes:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from .positions import PositionRecord
 
@@ -55,7 +56,7 @@ class AutofocusConfig:
     analysis_height_frac: float = 1.0         # central row band scored (tilt/defocus)
     raster_h_scale: Optional[float] = None    # None -> fork default box height
     settle_s: float = 1.0
-    frame_wait_s: float = 3.0
+    frame_wait_s: float = 3.0               # v0.54.0: only if DP_FROZEN is unreadable
     abort_on_failure: bool = False
 
 
@@ -74,12 +75,14 @@ class RefineConfig:
     enable_stage: bool = False
     stage_max_m: float = 100.0e-6
     strict_scan_rotation: bool = False
-    imaging_scan_rate: Optional[int] = 8      # raise dwell for SNR; None = leave as-is
+    # v0.54.0: the refine speed (set once per refine; Prepolish / Polish 3, see
+    # refine_scan_rates). None = leave as-is.
+    imaging_scan_rate: Optional[int] = 8
     scan_rate_method: str = "cmd"             # DP_SCANRATE is RO -> CMD_SCANRATE#
     analysis_height_frac: float = 1.0         # central row band scored (tilt/defocus)
     raster_h_scale: Optional[float] = None    # None -> fork default box height
     settle_s: float = 1.0
-    frame_wait_s: float = 3.0
+    frame_wait_s: float = 3.0               # v0.54.0: only if DP_FROZEN is unreadable
     abort_on_failure: bool = False
     calibration_file: Optional[str] = None   # refine_calibration.json (None -> default)
     # v0.39.0: 800x FALLBACK. If the 2000x refine cannot locate the site (low
@@ -91,6 +94,42 @@ class RefineConfig:
     coarse_scan_rate: Optional[int] = 5
     coarse_tolerance_m: float = 1.0e-6
     coarse_magnification_default: float = 800.0
+    # v0.54.0: SPEED FALLBACK. If the 2000x pass at imaging_scan_rate cannot correlate
+    # (low SNR / unreliable / did not converge), put the beam shift back and run it once
+    # more at this speed, BEFORE the 800x fallback. None = no speed fallback. Prepolish /
+    # Polish use 3 with fallback 8 (refine_scan_rates; Evan 2026-10-16).
+    fallback_scan_rate: Optional[int] = None
+
+
+# v0.54.0 (Evan, 2026-10-16): Prepolish / Polish refine at scan speed 3, with speed 8 as
+# the fallback. Measured at position_16 (Polish, broken lamella), 2000x, 2 frames each:
+# speed 6/8/5/3 -> correlation SNR 88.6/116.8/71.4/33.8 (gate 4.0), residual 0.02-0.05 um.
+# Rough keeps the imaging scan rate (8) until it is tested the same way.
+STAGE_REFINE_SCAN_RATES = {"prepolish": (3, 8), "polish": (3, 8)}
+
+
+def refine_scan_rates(stage: Optional[str], imaging_scan_rate: Optional[int],
+                      refine_scan_rate: Optional[int] = None,
+                      fallback_scan_rate: Optional[int] = None
+                      ) -> Tuple[Optional[int], Optional[int]]:
+    """(refine speed, fallback speed) for a milling stage.
+
+    refine_scan_rate / fallback_scan_rate: an explicit choice (None = the stage default;
+    -1 = leave the speed as it is / no fallback). Without a stage default the refine
+    speed is ``imaging_scan_rate`` and there is no fallback. A fallback equal to the
+    refine speed is dropped."""
+    st_rate, st_fb = STAGE_REFINE_SCAN_RATES.get(str(stage or "").lower(), (None, None))
+    if refine_scan_rate is None:
+        rate = st_rate if st_rate is not None else imaging_scan_rate
+    else:
+        rate = None if int(refine_scan_rate) < 0 else int(refine_scan_rate)
+    if fallback_scan_rate is None:
+        fb = st_fb
+    else:
+        fb = None if int(fallback_scan_rate) < 0 else int(fallback_scan_rate)
+    if rate is None or fb == rate:
+        fb = None
+    return rate, fb
 
 
 # --------------------------------------------------------------------------- #
@@ -177,6 +216,21 @@ def _resolve_coarse_reference(rec: PositionRecord,
     return p
 
 
+# v0.54.0: the 2000x results a slower (higher-SNR) frame can fix. Everything else --
+# a refusal (scan rotation), the wrong-sign signature, any stage outcome -- is never
+# retried at another speed.
+_SPEED_FALLBACK_MESSAGES = ("Low confidence", "Unreliable", "Residual", "Stopped after")
+
+
+def _speed_fallback_applies(res, cfg: "RefineConfig") -> bool:
+    fb = getattr(cfg, "fallback_scan_rate", None)
+    return (fb is not None and fb != cfg.imaging_scan_rate and not res.success
+            and res.method in ("none", "beam_shift")
+            and not res.stage_required_but_disabled and not res.stage_refused
+            and tuple(res.applied_stage_delta_m) == (0.0, 0.0)
+            and str(res.message or "").startswith(_SPEED_FALLBACK_MESSAGES))
+
+
 def _coarse_fallback_applies(res, cfg: "RefineConfig") -> bool:
     """True when the 2000x pass failed to LOCATE the site. Not when it located it but
     was not allowed / able to correct (stage disabled, or a stage guard refused): the
@@ -249,37 +303,103 @@ def run_refine_at_position(
     with Image.open(ref_path) as im:
         reference = np.asarray(im.convert("L"), dtype=np.float64)
 
+    t_start = time.time()
+    rate0 = cfg.imaging_scan_rate
     scope = ScopeRefineAdapter(sem, settle_s=float(cfg.settle_s),
                                frame_wait_s=float(cfg.frame_wait_s),
-                               imaging_scan_rate=cfg.imaging_scan_rate,
+                               imaging_scan_rate=rate0,
                                scan_rate_method=cfg.scan_rate_method, logger=log)
     try:
         beam0 = scope.get_beam_shift()       # to undo a failed 2000x pass before 800x
     except Exception:  # noqa: BLE001
         beam0 = None
-    res = refine_position(
-        scope, reference, float(rec.fib_magnification_x),
-        beam_shift_threshold_m=float(cfg.beam_shift_threshold_m),
-        residual_tolerance_m=float(cfg.residual_tolerance_m),
-        max_iterations=int(cfg.max_iterations), verify=bool(cfg.verify),
-        enable_stage=bool(cfg.enable_stage),
-        stage_max_m=float(cfg.stage_max_m),
-        beam_sign_x=beam_sign_x, beam_sign_y=beam_sign_y,
-        strict_scan_rotation=bool(cfg.strict_scan_rotation), logger=log,
-    )
+    stage0 = None
+    if cfg.enable_stage:
+        try:
+            stage0 = scope.get_stage_xy()    # v0.54.0 review: to undo a move after an error
+        except Exception:  # noqa: BLE001
+            stage0 = None
+
+    def _fine_pass():
+        return refine_position(
+            scope, reference, float(rec.fib_magnification_x),
+            beam_shift_threshold_m=float(cfg.beam_shift_threshold_m),
+            residual_tolerance_m=float(cfg.residual_tolerance_m),
+            max_iterations=int(cfg.max_iterations), verify=bool(cfg.verify),
+            enable_stage=bool(cfg.enable_stage),
+            stage_max_m=float(cfg.stage_max_m),
+            beam_sign_x=beam_sign_x, beam_sign_y=beam_sign_y,
+            strict_scan_rotation=bool(cfg.strict_scan_rotation), logger=log,
+        )
+
     coarse_stage = (0.0, 0.0)
     coarse_tried = False
-    if _coarse_fallback_applies(res, cfg):
-        coarse_tried = True
-        res, coarse_stage = _coarse_fallback(scope, rec, cfg, reference, res, beam0,
-                                             ref_base_dir=ref_base_dir,
-                                             beam_sign_x=beam_sign_x,
-                                             beam_sign_y=beam_sign_y, log=log)
+    speed_fb_used = False
+    try:
+        log(f"[refine] {rec.name}: 2000x pass at scan speed "
+            f"{rate0 if rate0 is not None else 'as set'}"
+            + (f" (fallback speed {cfg.fallback_scan_rate})"
+               if getattr(cfg, "fallback_scan_rate", None) is not None else ""))
+        res = _fine_pass()
+        if _speed_fallback_applies(res, cfg):
+            if beam0 is None:
+                log(f"[refine] {rec.name}: the beam shift could not be read before refine, "
+                    f"so it cannot be put back; no speed-{cfg.fallback_scan_rate} retry.")
+            else:
+                scope.set_beam_shift(*beam0)
+                log(f"[refine] {rec.name}: speed {rate0} did not correlate ({res.message}); "
+                    f"beam shift put back to ({beam0[0] * 1e6:+.2f}, {beam0[1] * 1e6:+.2f}) "
+                    f"um; retrying the 2000x pass at speed {cfg.fallback_scan_rate}.")
+                scope.imaging_scan_rate = int(cfg.fallback_scan_rate)
+                speed_fb_used = True
+                res = _fine_pass()
+                log(f"[refine] {rec.name}: speed-{cfg.fallback_scan_rate} retry "
+                    f"{'OK' if res.success else 'FAILED'}: {res.message}")
+        if _coarse_fallback_applies(res, cfg):
+            coarse_tried = True
+            res, coarse_stage = _coarse_fallback(scope, rec, cfg, reference, res, beam0,
+                                                 ref_base_dir=ref_base_dir,
+                                                 beam_sign_x=beam_sign_x,
+                                                 beam_sign_y=beam_sign_y, log=log)
+    except BaseException:
+        # v0.54.0: a frame refine must not use (StaleFrameError), a column change during
+        # a frame, ... -- put the beam shift back so nothing half-corrected is left.
+        if beam0 is not None:
+            try:
+                scope.set_beam_shift(*beam0)
+                log(f"[refine] {rec.name}: refine stopped; beam shift put back to "
+                    f"({beam0[0] * 1e6:+.2f}, {beam0[1] * 1e6:+.2f}) um.")
+            except Exception as e:  # noqa: BLE001
+                log(f"[refine] {rec.name}: WARNING: could not put the beam shift back "
+                    f"({e!r}).")
+        # v0.54.0 review: an error on the frame after a refine STAGE move skips refine's
+        # own undo, so a manual Align can leave the stage up to 100 um off. The stage is
+        # NOT moved back automatically (an unchecked move in an error path -- a mill may
+        # have started, the stage may have faulted); the Log says so loudly instead.
+        if stage0 is not None:
+            _warn_refine_stage_moved(scope, stage0, rec.name, log)
+        raise
+    finally:
+        try:
+            scope.restore_scan_rate()
+        except Exception as e:  # noqa: BLE001
+            log(f"[refine] {rec.name}: WARNING: could not restore the scan speed ({e!r}).")
+    duration_s = time.time() - t_start
+    log(f"[refine] {rec.name}: refine took {duration_s:.1f} s (scan speed "
+        f"{rate0 if rate0 is not None else 'as set'}"
+        + (f", then {cfg.fallback_scan_rate}" if speed_fb_used else "")
+        + (", then the 800x fallback" if coarse_tried else "") + ")")
     # For the run log (v0.40.0): note whether the 800x fallback ran and what stage move
-    # it kept. Annotation only -- nothing reads these to make decisions.
+    # it kept. v0.54.0: the scan speed, the speed fallback and the duration. Annotation
+    # only -- nothing reads these to make decisions.
     try:
         res.coarse_fallback_tried = coarse_tried
         res.coarse_stage_delta_m = tuple(coarse_stage)
+        res.scan_rate = rate0
+        res.speed_fallback_used = speed_fb_used
+        res.speed_fallback_scan_rate = (int(cfg.fallback_scan_rate) if speed_fb_used
+                                        else None)
+        res.duration_s = round(duration_s, 1)
     except Exception:  # noqa: BLE001
         pass
     if res.success and coarse_stage != (0.0, 0.0):
@@ -308,6 +428,26 @@ def run_refine_at_position(
                    if coarse_stage != (0.0, 0.0) else
                    " -- milling at the recalled position."))
     return res
+
+
+STAGE_UNDO_TOL_M = 1.0e-6   # refine's stage-arrival tolerance
+
+
+def _warn_refine_stage_moved(scope, stage0, name: str, log) -> None:
+    import math
+    try:
+        cur = scope.get_stage_xy()
+    except Exception as e:  # noqa: BLE001
+        log(f"[refine] {name}: *** WARNING: could not read the stage after the error "
+            f"({e!r}). Press Go to (recall the position) before milling. ***")
+        return
+    d = math.hypot(cur[0] - stage0[0], cur[1] - stage0[1])
+    if d <= STAGE_UNDO_TOL_M:
+        return
+    log(f"[refine] {name}: *** WARNING: refine moved the stage "
+        f"({(cur[0] - stage0[0]) * 1e6:+.1f}, {(cur[1] - stage0[1]) * 1e6:+.1f}) um (X/Y) "
+        f"and then stopped with an error; the stage was NOT moved back. Press Go to "
+        f"(recall the position) before pushing or milling. ***")
 
 
 def _coarse_fallback(scope, rec: PositionRecord, cfg: RefineConfig, reference, res,

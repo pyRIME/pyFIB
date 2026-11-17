@@ -191,7 +191,8 @@ class ToolsPage(QWidget):
             self._win.status("No positions file yet: capture a position or load a session.")
             return
         self._report_path = None
-        self._win.run_module("smartfib_executor.report", args,
+        # instrument=False (v0.55.1): the report reads files only
+        self._win.run_module("smartfib_executor.report", args, instrument=False,
                              on_line=self._on_report_line, on_done=self._on_report_done)
 
     def _on_report_line(self, line: str) -> None:

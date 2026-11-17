@@ -40,22 +40,21 @@ def scene_to_layout(x_scene: float, y_scene: float) -> Tuple[float, float]:
 
 
 def layout_angle_to_scene(angle_deg: float) -> float:
-    """Convert a layout rotation (CCW in y-up) to a scene rotation (y-down).
+    """Convert a layout RECT angle to a Qt item rotation (scene, y-down).
 
-    Flipping the y axis reverses the sense of rotation, so a CCW layout angle
-    becomes a CW scene angle. Qt's item rotation is clockwise-positive, which
-    means the scene angle we want is simply the layout angle unchanged in
-    magnitude but interpreted in Qt's frame; the net effect of the double flip
-    (y-sign and Qt's CW-positive) is that the numeric value is preserved. We
-    keep this as an explicit function so the reasoning is documented and any
-    future correction lives in one spot.
+    MEASURED in SmartFIB (2026-10-20): a positive RECT angle turns the box
+    COUNTER-CLOCKWISE as displayed (layout y up). The scene shows the layout with y
+    flipped back, so on screen that is counter-clockwise too, and Qt's item rotation
+    is clockwise-positive on screen -- hence the sign change. (pyFIB patch
+    0.9.1+pyfib.1: this used to return the angle unchanged, which drew every rotated
+    RECT turned the wrong way.)
     """
-    return angle_deg
+    return -float(angle_deg)
 
 
 def scene_angle_to_layout(angle_deg: float) -> float:
     """Inverse of :func:`layout_angle_to_scene`."""
-    return angle_deg
+    return -float(angle_deg)
 
 
 @dataclass

@@ -26,17 +26,26 @@ class _FrameStoreSem:
         self.live = False
         self.never_frozen = False   # simulate DP_FROZEN never reporting Frozen
         self.freeze_on = None
+        self.mag = None             # v0.53.4: AP_FIB_MAGNIFICATION is read back
+        self.unfreeze_ignored = 0   # v0.53.4: unfreezes SmartSEM drops (scan stays frozen)
 
     def set_value(self, m, v):
         if m == "DP_FREEZE_ON":
             self.freeze_on = v
+        if m == "AP_FIB_MAGNIFICATION":
+            self.mag = float(v)
 
     def execute(self, c):
         if c == "CMD_UNFREEZE_ZONE":
+            if self.unfreeze_ignored > 0:
+                self.unfreeze_ignored -= 1
+                return
             self.live = True
         elif c in ("CMD_FREEZE_ZONE", "CMD_FREEZE_ALL"):
             if self.live:
-                self.store = self.scene     # end-of-frame freeze completes a FRESH frame
+                # end-of-frame freeze completes a FRESH frame; a lower mag images a
+                # different field (the scene value stands in for the picture)
+                self.store = self.scene + (100 if self.mag == 800.0 else 0)
             self.live = False
 
     def get_str(self, m):
@@ -45,6 +54,8 @@ class _FrameStoreSem:
         return ""
 
     def get_float(self, m):
+        if m == "AP_FIB_MAGNIFICATION":
+            return self.mag if self.mag is not None else 348.7
         return {"AP_STAGE_AT_X": 1e-3, "AP_STAGE_AT_Y": 2e-3, "AP_STAGE_AT_Z": 3e-3,
                 "AP_FIB_OBJECTIVE_POTENTIAL": 16400.0, "AP_HEIGHT": 4.286e-5}.get(m, 0.0)
 
@@ -92,11 +103,19 @@ def test_freeze_after_grab_false_leaves_scan_live():
     assert _value(d / "A.bmp") == 50 and sem.live
 
 
-def test_unconfirmed_frame_is_recorded_as_a_warning():
+def test_unconfirmed_frame_is_refused():
+    # v0.54.0 review: with the immediate end-of-frame freeze, a frame whose end was never
+    # seen may still be the PREVIOUS frame store -> never a reference (was: a note).
+    from ..smartsem_com import SmartSEMError
     d = Path(tempfile.mkdtemp())
     sem = _FrameStoreSem(scene=50); sem.never_frozen = True
-    rec = _cap(sem, "A", d, frozen_timeout_s=0.3)
-    assert rec.notes and "DP_FROZEN did not report Frozen" in rec.notes
+    try:
+        _cap(sem, "A", d, frozen_timeout_s=0.3)
+    except SmartSEMError as e:
+        assert "DP_FROZEN did not report Frozen" in str(e) and "capture refused" in str(e)
+    else:
+        raise AssertionError("an unconfirmed frame was recorded")
+    assert (d / "A_suspect.bmp").exists() and not (d / "A.bmp").exists()
 
 
 def test_coarse_reference_is_grabbed_after_fine_and_mag_restored():
@@ -131,7 +150,7 @@ def test_coarse_failure_keeps_fine_capture_and_warns():
             super().__init__(scene); self.mag = 2000.0; self.mags = []
         def set_value(self, m, v):
             super().set_value(m, v)
-            if m == "AP_FIB_MAGNIFICATION": self.mag = float(v); self.mags.append(float(v))
+            if m == "AP_FIB_MAGNIFICATION": self.mags.append(float(v))
         def grab_bmp(self, path, **k):
             if self.mag == 800.0: raise RuntimeError("coarse grab failed")
             super().grab_bmp(path, **k)
@@ -141,6 +160,103 @@ def test_coarse_failure_keeps_fine_capture_and_warns():
     assert rec.image_bmp_coarse is None and rec.coarse_magnification_x is None
     assert rec.notes and "coarse reference" in rec.notes and "FAILED" in rec.notes
     assert sem.mags[-1] == 2000.0                               # mag restored
+
+
+def test_position_1_case_a_scan_that_never_restarts_gives_no_coarse_copy():
+    """Evan 2026-10-12: position_1's 800x file was a byte copy of its 2000x image -- the
+    scan never restarted for the coarse frame. Now: unfreeze resent, then retried once;
+    still stale -> no coarse reference (kept as _suspect), the fine capture stands."""
+    d = Path(tempfile.mkdtemp())
+    sem = _FrameStoreSem(scene=50)
+    real_set = sem.set_value
+
+    def set_value(m, v):                      # SmartSEM drops every unfreeze at 800x
+        real_set(m, v)
+        if m == "AP_FIB_MAGNIFICATION" and float(v) == 800.0:
+            sem.unfreeze_ignored = 2
+    sem.set_value = set_value
+    rec = _cap(sem, "position_1", d, coarse_magnification_x=800.0)
+    assert _value(d / "position_1.bmp") == 50
+    assert rec.image_bmp_coarse is None and rec.coarse_magnification_x is None
+    assert "not a new frame twice" in rec.notes and "FAILED" in rec.notes
+    assert (d / "position_1_coarse_suspect.bmp").exists()
+    assert not (d / "position_1_coarse.bmp").exists()
+    assert sem.mag == 2000.0                                   # restored
+
+
+def test_a_dropped_unfreeze_is_resent_and_the_frame_is_fresh():
+    d = Path(tempfile.mkdtemp())
+    sem = _FrameStoreSem(scene=50)
+    real_set = sem.set_value
+
+    def set_value(m, v):                      # the first unfreeze at 800x is dropped
+        real_set(m, v)
+        if m == "AP_FIB_MAGNIFICATION" and float(v) == 800.0:
+            sem.unfreeze_ignored = 1
+    sem.set_value = set_value
+    rec = _cap(sem, "A", d, coarse_magnification_x=800.0)
+    assert rec.coarse_magnification_x == 800.0 and _value(d / "A_coarse.bmp") == 150
+    assert (d / "A.bmp").read_bytes() != (d / "A_coarse.bmp").read_bytes()
+
+
+def test_identical_coarse_frame_is_retried_once():
+    """The frame store did not change although the scan reported Live (a dropped
+    magnification change, say): byte-identical to the fine image -> one retry."""
+    d = Path(tempfile.mkdtemp())
+    sem = _FrameStoreSem(scene=50)
+    calls = {"n": 0}
+    real_exec = sem.execute
+
+    def execute(c):
+        real_exec(c)
+        if c in ("CMD_FREEZE_ZONE", "CMD_FREEZE_ALL") and sem.mag == 800.0:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                sem.store = 50                # first coarse frame: same picture as fine
+    sem.execute = execute
+    rec = _cap(sem, "A", d, coarse_magnification_x=800.0)
+    assert calls["n"] == 2 and rec.coarse_magnification_x == 800.0
+    assert _value(d / "A_coarse.bmp") == 150
+
+
+def test_magnification_that_does_not_take_refuses_or_skips():
+    from ..smartsem_com import SmartSEMError
+    d = Path(tempfile.mkdtemp())
+    sem = _FrameStoreSem(scene=50)
+    sem.set_value = lambda m, v: None         # sets ignored: reads 348.7x
+    try:
+        _cap(sem, "A", d)
+    except SmartSEMError as e:
+        assert "reads 348.7x after setting 2000x" in str(e)
+    else:
+        raise AssertionError("capture at the wrong magnification was accepted")
+    assert not (d / "A.bmp").exists()
+    sem = _FrameStoreSem(scene=50)            # coarse set ignored: fine kept, no coarse
+    real_set = sem.set_value
+    sem.set_value = lambda m, v: None if (m == "AP_FIB_MAGNIFICATION" and float(v) == 800.0) \
+        else real_set(m, v)
+    rec = _cap(sem, "B", d, coarse_magnification_x=800.0)
+    assert rec.image_bmp and rec.image_bmp_coarse is None
+    assert "reads 2000.0x after setting 800x" in rec.notes and not (d / "B_coarse.bmp").exists()
+
+
+def test_a_magnification_change_during_the_fine_frame_refuses_the_capture():
+    from ..smartsem_com import SmartSEMError
+    d = Path(tempfile.mkdtemp())
+    sem = _FrameStoreSem(scene=50)
+    real_grab = sem.grab_bmp
+
+    def grab(path, **k):
+        real_grab(path, **k)
+        sem.mag = 52.0                         # SmartSEM changed it under the frame
+    sem.grab_bmp = grab
+    try:
+        _cap(sem, "A", d)
+    except SmartSEMError as e:
+        assert "read 52.0x after the frame" in str(e)
+    else:
+        raise AssertionError("not refused")
+    assert (d / "A_suspect.bmp").exists() and not (d / "A.bmp").exists()
 
 
 def test_no_coarse_by_default():

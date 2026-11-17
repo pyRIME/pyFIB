@@ -13,22 +13,28 @@ class PostMillFIB:
     """Mag lowered by milling; a set only sticks once in FIB imaging mode."""
     def __init__(self):
         self.mag = 500.0; self.imaging = False; self.mag_at_grab = []
+        self.frozen = True; self.freeze_on = "End Frame"
     def set_value(self, m, v):
         if m == "AP_FIB_MAGNIFICATION" and self.imaging:
             self.mag = float(v)
+        if m == "DP_FREEZE_ON":
+            self.freeze_on = str(v)
     def get_float(self, m):
         return {"AP_FIB_MAGNIFICATION": self.mag,
                 "DP_FIB_IMAGING": 1.0 if self.imaging else 0.0,
                 "AP_FIB_PIXEL_SIZE": 5.58e-8, "AP_FIB_SCAN_ROTATION": 0.0,
-                "DP_FROZEN": 1.0, "DP_SCANRATE": 8.0,
+                "DP_FROZEN": 1.0 if self.frozen else 0.0, "DP_SCANRATE": 8.0,
                 "AP_FIB_OBJECTIVE_POTENTIAL": 16400.0, "AP_FIB_BEAM_SHIFT_X": 0.0,
                 "AP_WIDTH": 5.715e-5}.get(m, 0.0)
     def get_str(self, m):
         if m == "DP_FIB_IMAGING": return "FIB" if self.imaging else "SEM"
-        if m == "DP_FROZEN": return "Frozen"
+        if m == "DP_FROZEN": return "Frozen" if self.frozen else "Live"
+        if m == "DP_FREEZE_ON": return self.freeze_on
         return ""
     def execute(self, c):
         if c == "CMD_FIB_MODE_FIB": self.imaging = True
+        if c == "CMD_UNFREEZE_ZONE": self.frozen = False
+        if c in ("CMD_FREEZE_ZONE", "CMD_FREEZE_ALL"): self.frozen = True
     def grab_bmp(self, path, **k):
         self.mag_at_grab.append(self.mag)
         from PIL import Image

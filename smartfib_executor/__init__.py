@@ -21,6 +21,482 @@ New in pyFIB v0.4.0:
 UI theme:
 - Black + gold UI (ttk theme + custom styles) (ttk theme + custom styles).
 
+New in pyFIB v0.55.1 (crash sources from the 2026-11-11 code review; bugs #16, #18-#22):
+- #16 (HIGH, safety): a batch never writes the FIB beam shift while SmartSEM indicates
+  milling. Before, the reset after every site (and before the first) ran whatever the
+  state: after "Timeout waiting for milling to finish" (90 min, fixed in the tabs), after
+  "milling did not start", after Ctrl+C, with --wait none / sleep, and when the pyFIB
+  window died during a mill (the batch's next print raised on the closed pipe). Now
+  batch._reset_beam_shift_when_idle checks milling_state first (strict batch rule; an
+  unreadable state = milling). A site that ended without a confirmed end of milling must
+  read "not milling" for the Confirm-done window before the reset. A skipped reset is done
+  at the next site, after its interlock and before its stage move (or by Go to). Batch
+  start waits for a running mill before the first reset. Not measured: whether SmartSEM
+  applies a beam-shift write mid-pattern.
+- #16, lost window: smartfib_executor/safe_output.py -- a command's stdout / stderr can no
+  longer raise (cli.main installs it). A batch whose window is gone finishes the site in
+  progress normally (wait for done, after image, beam-shift reset) and stops before the
+  next stage move (BatchStopped; run log "stopped"; runs/run_<time>.log keeps the output).
+  If the window went away before a site's mill was started (during recall, autofocus or
+  refine), that mill is NOT started. --continue-on-error never overrides either stop.
+- #16, end of batch: a reset still pending after the last site is tried once more; if
+  SmartSEM still indicates milling the batch ends with a loud warning and a run-log note
+  (notes.beam_shift_not_reset) instead of "completed" with the correction left on.
+- #21: "Mill timeout (min)" on the Rough Mill / Prepolish / Polish tabs, default 240,
+  range 10-1440, passed as --timeout (seconds). The CLI default stays 5400 s. The dry-run
+  plan prints it. A site that mills longer still ends as an error; the pattern is not
+  stopped and the beam is left alone (see #16).
+- #18: GISDEP's 150 ms live-state timer runs only while its tab is shown and no pyFIB
+  command runs, and its panel is greyed out while one runs (two programs never drive the
+  stage / needles at once). A pyFIB command is refused while GISDEP runs a step. The tab is
+  not opened (no connection made) while a command runs -- it used to come up on the MOCK for
+  the rest of the session. GISDEP's connection is released when pyFIB closes. A command
+  started while the window holds GISDEP's connection logs "[connect] note: the pyFIB window
+  (PID n) holds a SmartSEM connection of its own". NOT built: closing GISDEP's connection
+  when its tab is left and reconnecting on return -- reconnecting the same API object has
+  never been tried on the instrument (CONNECTION_TEST.txt step 4 measures the two-client
+  case first). gisdep/ itself is unchanged.
+- #19: positions.json -- the Positions tab saves only when a pattern link really changed
+  (it re-saved on every look once a session had an authored pattern); saves use a temp
+  name unique per process and call, retry for about a second while Windows has the file
+  locked, and keep the previous version as positions.json.prev (atomic_io.py; also the run
+  log and runs/manual_state.json). Temp files left by a killed process are removed after
+  an hour.
+- #20: a non-finite number (NaN / infinity) is never sent to MoveStage, never counts as
+  "arrived", refuses a recall before anything is set, is refused when positions.json is
+  loaded for stage / objective / magnification (also 1e999 and a file that is not an
+  object; a non-finite OPTIONAL reading loads as not recorded, so older files still open),
+  is never saved for those fields or a recorded tilt, and is refused at capture.
+- #22: requirements.txt lists numpy, qtpy and PyQt5 (the window needs them).
+- Independent safety review (2026-11-11): no high finding; 4 medium and 8 low, fixed here
+  (a mill no longer starts after the window is gone; GISDEP opens a few seconds after a
+  command ended, never back to back, and not after close; the end-of-batch warning; older
+  files with a NaN in an optional field still load; a failed launch cannot leave GISDEP
+  greyed out; the standalone pyMap window and the report do not pause GISDEP; an
+  unencodable character is not a lost window; the pending reset waits the Confirm-done
+  window; backup named .prev so refine.offset_position's .bak is kept).
+- Second review pass: fixes confirmed; two low items closed (GISDEP is built once, by one
+  re-armed timer; the run log notes an un-reset beam shift as soon as it happens).
+- Tests: tests/test_mill_safety.py (31), gui_qt/tests/test_mill_safety_gui.py (10).
+  Full suite 1423 passed, also on Python 3.9 with numpy 1.26.4 and PyQt5 5.15.
+  Instrument check: test_scripts/MILL_SAFETY_TEST.txt and CONNECTION_TEST.txt step 4.
+- Unchanged: runner.py (load / prepare / start / done detection), refine, capture's frame
+  sequence, the tilt guard, the manual buttons, gisdep/, pymap/, elymaker/.
+
+New in pyFIB v0.55.0 (pyMap v0.9.2 bundled; no silent crashes -- Evan, 2026-11-05):
+- pyMap v0.9.2 replaces the bundled v0.9.0 (v0.9.1 was never bundled): pymap/ and
+  pymap_tests/ as delivered, unchanged (pymap/VENDORED.txt). It logs every action to
+  <pyFIB>/logs/pymap.log, dumps thread stacks to pymap_hangs.log when an action runs over
+  30 s, reports a pyMap run that ended without closing, and stops its own errors inside
+  pyMap. Its hooks chain onto pyFIB's. requirements-pymap.txt: nothing new.
+- pyMap's requests (its notes, revision 3): (1) a new session no longer destroys pyMap --
+  set_session keeps its images, landmarks and targets and unlinks an overview from the
+  old session; landmark pairs carried over get a warning (their FIB points belong to the
+  old overview: re-pick or clear them before writing targets); a pyMap without
+  set_session is rebuilt only after asking when landmarks exist; each change is logged. (2) The targets table can no longer jam (_filling in
+  try/finally); an unreadable targets file shows in the tab; the 3 s targets poll logs
+  an error instead of raising. (3) Closing pyFIB docks detached pyMap / ELYMaker windows
+  back (they kept the process alive).
+- pyFIB's own crash paths (gui_qt/errors.py, app.py, worker.py):
+  * closing with a command running asks: Keep pyFIB open (default), Close when it
+    finishes (nothing new starts; pyFIB closes itself afterwards), or Kill it now -- only
+    behind a second question that says pyFIB will NOT abort milling. The state is re-read
+    after every dialog and new commands are refused while closing. Closing while GISDEP
+    runs a step is refused. Before, a running QThread was dropped (Qt abort, or pyFIB
+    exiting with the child still running unread).
+  * a repeating error (e.g. from GISDEP's 150 ms timer) shows one box per minute and
+    counts the rest, instead of stacking boxes in front of the STOP button.
+  * errors raised in other threads reach the Log tab through the GUI thread (touching a
+    widget from a worker thread can crash natively); the hook works without a console
+    (pythonw); unraisable errors and Qt critical / FATAL messages go to
+    logs/pyfib_gui_errors.log; hooks installed before the QApplication exists.
+  * run marker logs/pyfib_run_<pid>.json (60 s heartbeat, tab, last command and its pid):
+    a run that ended without closing (hard crash, kill, power loss) is reported at the
+    next start in a box, the Log tab and the errors log -- including whether the command
+    it was running is STILL running.
+  * a command that crashes natively (e.g. 0xC0000005 access violation in the ZEISS API)
+    is named in a box and the Log tab, with "check the microscope" -- not "Exited with
+    code 3221225477".
+  * the command output reader decodes UTF-8 with replacement (child PYTHONIOENCODING
+    utf-8): an undecodable byte no longer ends the reader while the child keeps running
+    unread (it then blocked when the pipe filled).
+  * New session: each tab reloads on its own and an error is logged (was swallowed).
+  * Run menu > Open logs folder.
+- Independent review (2026-11-05): 3 high, 2 medium and 5 low findings, all fixed.
+- Tests: gui_qt/tests/test_crash_safety.py (19, incl. a real Qt abort, a real native
+  crash in a child and a real kill-then-close); pyFIB's GUI tests send pyMap's log to a temporary folder
+  (PYMAP_LOG_DIR). No instrument code changed.
+
+New in pyFIB v0.54.4 (user guide, documentation only):
+- docs/USER_GUIDE.md: start-to-finish guide for GitHub (install and launch, the window,
+  safety rules, sessions, every tab, refine and the single-frame protocol, the Log and
+  report, the command line, troubleshooting), with screenshots of the v0.54.3/v0.54.4 GUI
+  (demo session), four diagrams and instrument images in docs/images. README.md links it.
+- Same guide as the Claude Docs "pyFIB User Guide" (2026-11-04). No code changed.
+
+New in pyFIB v0.54.3 (bug #17: rotated rectangles drawn where SmartFIB mills them):
+- MEASURED in SmartFIB (Evan, 2026-10-20, pyFIB_rotation_test.ely, 30 deg bars with
+  height +2 and -2): SmartFIB rotates a RECT about the CENTRE of its box,
+  COUNTER-CLOCKWISE for a positive angle. ELYMaker and pyFIB's report drew rotated RECTs
+  CLOCKWISE about the anchor: ~10 um off at 30 deg; at 180 deg (common in SmartFIB-saved
+  waffle files) a whole box away (Waffle_bulk.ely: drawn x 68.4..86.5 um, milled
+  x 86.5..104.7 um). Files were always written unchanged -- milling was never affected,
+  only what was SHOWN. Re-check anything placed by eye on a rotated rectangle in
+  ELYMaker before this version.
+- Bundled ELYMaker -> 0.9.1+pyfib.1 (elymaker/PYFIB_PATCHES.md, upstream patch
+  elymaker/elymaker_rect_rotation.patch): geometry.rect_corners is the one rule; the
+  GUI pivots about the box centre and turns counter-clockwise (positions and angles are
+  saved exactly as read); the SVG preview, bounds, measure label and the field-of-view
+  check use the rotated corners (the check used to treat x, y as the centre).
+- pyFIB report: report/overlay.rect_corners_layout (pattern overlays on images and the
+  pattern drawing) uses the same rule.
+- Tests: elymaker_tests/test_v091_rect_rotation.py (48: the measured bars, the waffle
+  hinge where it was milled, GUI = geometry for many angles and both height signs,
+  round trip, resize, properties panel, mirror exact, preview, validate);
+  report test_rotated_rect_is_drawn_where_smartfib_places_it. No instrument code changed.
+
+New in pyFIB v0.54.2 (logo top left, ARM bottom left):
+- Evan, 2026-10-18: the logo goes where the ARM button was (top left of the top bar,
+  lined up with the nav column) and the ARM button moves to the bottom of the left nav
+  bar. Same button and wiring (ArmBar still creates it; win.arm_bar.arm_btn, is_armed()),
+  still on every page and still red when armed; in the nav its label uses two lines
+  ("ARM / (dry-run)", "ARMED / (instrument live)"). ArmBar(brand=..., arm_in_bar=False);
+  branding.brand_label(height=...). No instrument code changed.
+- Test: logo first in the top bar, ARM last in the nav, toggling still arms.
+
+New in pyFIB v0.54.1 (the pyFIB logo):
+- Evan, 2026-10-18: logo direction B, "the mill pattern" -- a trench rectangle above and
+  below a horizontal lamella, with the marker tick to its left; in the wordmark the "I"
+  is the same pattern. Files in assets/logo (README there): vector masters (text as
+  outlines), the mark as PNG 16-1024 px (16 and 24 pixel-fitted), pyfib.ico, and the
+  mark + wordmark for dark and light backgrounds.
+- Qt GUI: window and taskbar icon (on Windows the process gets its own taskbar identity,
+  so the taskbar shows the logo instead of python.exe's), and the logo replaces the
+  "pyFIB" text at the top of the nav bar (tooltip: the version). New gui_qt/branding.py;
+  a missing file falls back to no icon / the plain text. The tkinter GUI is unchanged.
+- No instrument code changed (same as v0.54.0 otherwise).
+- Tests: logo files complete and sized, SVGs without font dependencies, window icon sizes,
+  nav lockup and its text fallback.
+
+New in pyFIB v0.54.0 (one single-frame protocol; the switch to FIB imaging; refine at speed 3):
+- Evan, 2026-10-16: at scan speed 3 SmartSEM scanned several frames for one image -- every
+  grab scanned live for a fixed 3 s (about 8 frames at 0.36 s) before the freeze. Now ONE
+  protocol wherever pyFIB needs a frame (capture fine + 800x, after image, refine, FIB
+  autofocus, CLEM SEM/FIB overviews): frame_grab.grab_fresh_frame
+    1. the scan speed is set once by the caller for its sequence;
+    2. DP_FREEZE_ON = End Frame and READ BACK -- anything else refuses (FreezeModeError),
+       nothing is scanned;
+    3. unfreeze, DP_FROZEN must read Live within 2 s (resent once; else the old store:
+       SCAN_NOT_RESTARTED, as v0.53.4);
+    4. the end-of-frame freeze is requested AT ONCE -> one pass;
+    5. wait for Frozen up to 2 x AP_FRAME_TIME (re-read once if the speed just changed;
+       60 s with a log warning if AP_FRAME_TIME is unreadable); a brief DP_FROZEN read
+       failure does not end the wait, and a frame whose end was never seen is not used
+       (FRAME_NOT_FROZEN);
+    6. Grab(); the scan is left frozen;
+    7. checks, each retried once (one more frame): Live -> Frozen < 0.5 x AP_FRAME_TIME
+       (FRAME_TOO_SHORT; skipped for autofocus's reduced raster, for frames under 0.3 s
+       (speeds 1-2) and when AP_FRAME_TIME is unreadable) and a file byte-identical to the previous grab on the connection
+       (FRAME_IDENTICAL). frame_grab.is_stale_warning() names the frames that must not be
+       used: capture refuses, after image / overview keep *_suspect.bmp, refine and
+       autofocus raise StaleFrameError (refine never corrects from such a frame);
+    8. every frame logs "[frame] speed N, AP_FRAME_TIME x s, Live -> Frozen y s".
+  Frame averaging is left as the operator set it (Frames to average = 1). frame_wait_s is
+  now only the wait when DP_FROZEN is unreadable; frozen timeouts default to 60 s.
+- Bug #14 (2026-10-13, 2 of 21 positions): after SmartFIB hands back, SmartSEM is in SEM
+  imaging and the next switch to FIB resets the FIB to its lowest magnification (~176x),
+  sometimes AFTER pyFIB had set 2000x and read it back. frame_grab.ensure_fib_imaging is
+  now the switch at all six places (capture, after image, refine, FIB autofocus, CLEM
+  markup, run --fib-mag): CMD_FIB_MODE_FIB only if not already in FIB imaging, wait for
+  FIB, then >= 0.5 s and until AP_FIB_MAGNIFICATION is unchanged for 1 s (at most 5 s),
+  logging any change with its time; only then is the magnification set. Already in FIB
+  imaging: nothing sent, no wait.
+  * After image: a magnification / imaging change during the frame retakes it ONCE from
+    the switch (one more frame); a second change keeps *_suspect.bmp as before.
+  * Refine and autofocus read the magnification after every frame; a change raises.
+  * CLEM markup reads the magnification again right before milling (refuses if changed).
+  * debug-fib-imaging also logs AP_FIB_MAGNIFICATION, AP_FRAME_TIME, DP_SCANRATE and
+    DP_FREEZE_ON (read only).
+- Refine speed (Evan, 2026-10-16, position_16 Polish: speed 6/8/5/3 -> SNR
+  88.6/116.8/71.4/33.8, gate 4.0, residual 0.02-0.05 um): Prepolish / Polish refine at
+  speed 3; if the 2000x pass cannot correlate (low confidence, unreliable, did not
+  converge) the beam shift is put back and the pass runs once more at speed 8, then the
+  800x fallback as before. Never retried at another speed: a refusal (scan rotation), the
+  wrong-sign signature, any stage outcome. Rough keeps 8 until tested the same way.
+  * milling_workflow.refine_scan_rates / RefineConfig.fallback_scan_rate; the refine
+    adapter sets the speed once per refine (restore_scan_rate() puts the original back at
+    the end, also after an error). An error during refine puts the beam shift back.
+  * CLI: mill-positions / site align --refine-scan-rate and --refine-fallback-scan-rate
+    (default: the stage's). --imaging-scan-rate stays the autofocus speed (and Rough's
+    refine speed).
+  * Mill tabs: new "Refine scan rate" box (Prepolish / Polish 3, Rough 8); the old box is
+    "AF scan rate".
+  * Run log / manual state refine summary: scan_rate, speed_fallback_used,
+    speed_fallback_scan_rate, duration_s; the report notes "speed 8 retry used".
+- Independent safety review (2026-10-17), fixed in this version:
+  * a brief DP_FROZEN read failure ended the wait for Live or Frozen at once and the frame
+    was grabbed mid-scan with no warning -> both waits poll to their deadline (with
+    DP_FROZEN unreadable the fallback wait follows a longer AP_FRAME_TIME), and a
+    frame whose end was never seen (FRAME_NOT_FROZEN) is not used anywhere (capture
+    refuses; was a note). The capture's 800x frame waits 0.3 s after its speed change.
+  * the after-image retake sent commands without re-checking milling -> it retakes only
+    for a magnification change with FIB imaging still on and milling_active() false
+    (checked again); otherwise *_suspect.bmp.
+  * an error on a frame after a refine STAGE move leaves the stage moved (manual Align ->
+    Push could mill off-site) -> a loud Log warning with the offset: "the stage was NOT
+    moved back. Press Go to ... before pushing or milling". No automatic move-back: the
+    second review found it would be an unchecked stage move in an error path (a mill may
+    have started, the stage may have faulted).
+  * frames under 0.3 s (speeds 1-2) are not timed (the polls cannot resolve them); the
+    time is from the Live sighting, as agreed.
+  * FreezeModeError in a CLEM overview is a refusal, not a traceback; autofocus puts the
+    objective back to its start voltage when an error stops the sweep; a failed freeze
+    request is logged.
+  Left for later (bug list): markup's re-check runs before SmartFIB's load / prepare
+  delays; run --fib-mag has no milling guard (pre-existing); frame averaging is not
+  checked (Evan's decision); one unusable speed-3 frame stops refine without the
+  speed-8 / 800x fallbacks (safe).
+- Tests: test_single_frame (one pass at speed 3 and 8, End Frame refusal, too-short and
+  identical retries, 2 x frame-time timeout, late frame-time read, DP_FROZEN unreadable,
+  scan not restarted, the switch with a late magnification reset, after-image retake,
+  capture switch only when needed); test_refine_speed (stage defaults, speed-8 retry from
+  the original beam shift, set once + restored, no retry after refusals / stage outcomes,
+  before the 800x fallback, beam and speed restored after an error, CLI); markup switch and
+  late reset. Fakes now model DP_FREEZE_ON read-back, AP_FRAME_TIME and Live/Frozen.
+  Instrument check: test_scripts/SINGLE_FRAME_TEST.txt.
+
+New in pyFIB v0.53.5 (manual buttons: a SmartFIB snapshot no longer blocks them; 3 s wait):
+- Evan, 2026-10-13 (bug #15): Record after image refused "SmartSEM indicates milling"
+  right after a SmartFIB snapshot, with nothing milling. Measured with debug-fib-imaging
+  (number and text agree): milling = DP_FIB_MODE 2 'Milling', DP_FIB_IMAGING 4 'Mill + SEM',
+  DP_PATTERNING_MODE 3 'FIB + SEM'; finished = 0 'Imaging', 0 'SEM', 0 'Off'; after a
+  snapshot = 0 'Imaging', 1 'FIB', 2 'FIB'. The check refused on any patterning mode but 0.
+- batch.milling_state(sem, snapshot_ok=False) -> (active, reason); _is_milling_active is a
+  wrapper (strict). Every flag is read as text AND number; either one saying milling =
+  milling; DP_FIB_MODE's number is still required (unreadable = milling, as before);
+  DP_FIB_IMAGING / DP_PATTERNING_MODE unreadable as both = milling (patterning was ignored).
+  * snapshot_ok=True -- the operator's buttons (site_ops guard: Go to, Align, Push, Record
+    after image; CLEM overview, Mark targets): DP_PATTERNING_MODE Off (0) and FIB (2) are
+    not milling; FIB + SEM (3) and any other number are.
+  * strict (default) -- batch interlock before each stage move, after images: only Off (0)
+    is not milling, as before. Independent review 2026-10-14: pyFIB's own runner writes
+    DP_PATTERNING_MODE = 'FIB' right after CMD_FIB_START_MILLING (from SerialFIB), so in a
+    batch 'FIB' can mean a pyFIB mill is running. A SmartFIB snapshot before a batch Start
+    therefore still makes the batch wait (the message now names DP_PATTERNING_MODE = 2
+    'FIB'; Evan's SEM on/off resets it).
+- Refusals name the flag and what it read, e.g. "Record after image for position_17
+  refused: SmartSEM indicates milling (DP_PATTERNING_MODE = 3 'FIB + SEM'). Nothing was
+  changed." The batch's wait message says the same.
+- Manual buttons (Rough Mill / Prepolish / Polish: Go to, Align, Push pattern, Record after
+  image) watch for 3 s (site_ops.MANUAL_GUARD_S; were 10 s for Go to / Align with stage
+  moves, 5 s otherwise). Evan accepts the small risk for button presses made at the scope.
+  Batch interlocks unchanged; CLEM overview and Mark targets keep 5 s (GUARD_S).
+- runner._get_patterning_mode_code reports the measured codes (FIB was logged as 1); every
+  non-zero code still means "not done", so mill-finished detection is unchanged.
+- New read-only CLI: `python -m smartfib_executor.cli milling-check` prints the three flags
+  and what the manual buttons and a batch would decide. Sends nothing.
+- Tests: test_milling_state (the three measured states, single flags, text/number
+  disagreement, unknown and unreadable values, refusal text, 3 s windows for all four
+  buttons, runner codes); test_mill_stages fake reports the flags as text like the
+  instrument. Instrument check: test_scripts/MILLING_CHECK_TEST.txt.
+
+New in pyFIB v0.53.4 (capture: the frame must be new and at the right magnification):
+- Evan, 2026-10-12: position_1's 800x coarse reference was a BYTE COPY of its 2000x image
+  (identical files): the scan never restarted for the coarse frame, so Grab() saved the
+  frozen 2000x frame again; position_2 was fine. Nothing caught it: the fresh-frame check
+  only waited for DP_FROZEN = Frozen (already true), the magnification was never read
+  back, and the record (and its pixel size) uses the REQUESTED magnification.
+- frame_grab.grab_fresh_frame: after CMD_UNFREEZE_ZONE the scan must report Live within
+  2 s; if not, the unfreeze is sent once more; if it still stays Frozen the result is a
+  "the scan did not restart after the unfreeze ... incomplete or stale" warning.
+- capture_position: the magnification is set and READ BACK (retry once) before the
+  2000x frame -- not established -> capture refused, nothing saved -- and again after
+  the frame (changed -> kept as _suspect, refused). A 2000x frame whose scan did not
+  restart is refused (kept as _suspect).
+- Coarse (800x) frame: magnification read back before (not established -> no coarse
+  frame, warning; the 2000x capture stands) and after; a coarse frame byte-identical to
+  the 2000x image, or whose scan did not restart, is retried once; still not new -> no
+  coarse reference recorded (kept as <name>_coarse_suspect.bmp), with a warning. The
+  magnification is restored to 2000x with a read-back.
+- Also: a SEM overview whose scan did not restart is refused; any after image whose scan
+  did not restart is renamed _suspect.
+- tests/test_capture_fresh_frame.py: 5 new tests (incl. the position_1 case); capture
+  test fakes now read the magnification back like the instrument.
+
+New in pyFIB v0.53.3 (one SmartSEM connection at a time):
+- Evan, 2026-10-12: Rough Mill Start (armed) showed the ZEISS "RRemoting Error: Failed to
+  create an instance of Managed ... unable to open port for incoming connections" and the
+  run ended with exit -1073741819 (access violation inside the ZEISS API), even after
+  restarting everything, while v0.39.0 worked. The connection code is identical in both;
+  the difference: since v0.46.0 an armed Start ran a read-only --tilt-check process and
+  then the armed batch about a second later -- two SmartSEM connections back to back. A
+  hung python.exe titled "Remoting Forwarding Window" (the ZEISS API's hidden window, i.e.
+  a process holding a connection) was seen in tasklist.
+- Armed Start now runs the armed batch directly: ONE connection. The batch already checks
+  the 2-degree tilt limit itself before any motion; it now also prints the TILT-CHECK line.
+  If positions are out of range it stops (exit 3, nothing moved), pyFIB asks, and only on
+  OK starts it again with --accept-tilt-skips (the only case with a second connection).
+- smartsem_com: before creating the API object, wait up to 20 s for any OTHER python.exe /
+  pythonw.exe holding a SmartSEM connection (its window is "Remoting Forwarding Window";
+  never this process or the pyFIB window that started it); if one is still there, refuse
+  with its PID and state -- no ZEISS popup, no crash, nothing sent. The GISDEP tab checks
+  once and never waits.
+- The command line writes hard crashes to logs/pyfib_faults.log (faulthandler).
+- test_scripts/api_check.py: also lists pythonw.exe and marks processes holding a SmartSEM
+  connection (and whether they are Not Responding).
+- tests/test_smartsem_guard.py (3 tests); tilt and armed-start GUI tests updated.
+
+New in pyFIB v0.53.2 (embedded tools: no more crashes, resizing or cramped panels):
+- Crashes (Evan, 2026-10-12: "the correlation tab seems to be crashing quite a bit"):
+  PyQt5 ABORTS the process when an error escapes a button handler and no
+  sys.excepthook is set (measured: exit 134). pyMap, ELYMaker and GISDEP run inside
+  pyFIB, so any unhandled error in them closed pyFIB. Found with Evan's confocal
+  (Maximum_Projection_overlay.tif: RGB, 2437 x 1947, LZW-compressed, no ImageJ/OME
+  metadata): tifffile cannot decode LZW without the imagecodecs package and raises a
+  ValueError that pyMap's Open Confocal does not catch (it catches only its own import
+  error). Fixes on pyFIB's side:
+  * gui_qt/errors.py, installed by the GUI: an error in any handler is shown in a
+    warning box and the Log tab and written to <pyFIB>/logs/pyfib_gui_errors.log;
+    pyFIB keeps running. faulthandler writes hard crashes to logs/pyfib_faults.log.
+  * requirements-pymap.txt: imagecodecs==2024.6.1 (last build before NumPy 2, Python
+    3.9 Windows wheel) -- re-run `python -m pip install -r requirements-pymap.txt`.
+  * With imagecodecs, Evan's file and synthetic ImageJ / OME multichannel stacks (3 ch
+    x 5 z 16-bit, 4 ch 8-bit, 2 ch x 3 z OME, 2 ch plain) went through every visible
+    pyMap control offscreen with no error. Reported to the pyMap Claude (project doc).
+- ELYMaker grew the maximised window past the screen when a shape was selected (the
+  right-hand dock column cannot scroll: ~1100 px tall with nothing selected, ~1600 px
+  with a rectangle; that minimum became pyFIB's and Qt never shrinks a window back).
+  gui_qt/embedding.py, applied from outside (the bundled ELYMaker 0.9.1 is unchanged):
+  the Tools / Properties / New-shape defaults panels scroll; Properties and New-shape
+  defaults share one slot as tabs below Tools (selecting a shape brings Properties to
+  the front); the embedded window's minimum size no longer reaches pyFIB.
+- "Open in own window" for ELYMaker (tab bar) and pyMap (Correlation tab): the same
+  widget, with everything in it, moves into its own window (second monitor,
+  maximised); closing that window brings it back. Handoffs (Author pattern, Edit in
+  ELYMaker) go to the detached window. A session change rebuilds pyMap and keeps it in
+  its own window. pyMap's minimum size no longer reaches pyFIB either.
+- gui_qt/tests/test_embedding.py (5 tests, in `python -m smartfib_executor.gui_qt.tests`).
+
+New in pyFIB v0.53.1 (after-mill image: right magnification and focus, or none):
+- Evan, 2026-10-11: when SmartFIB completes a mill it often resets to SEM imaging and a
+  very low FIB magnification. The after image is the next stage's alignment reference, so:
+  * before anything is changed, the Log shows what SmartFIB left: "[after-image] SmartFIB
+    left: imaging ..., FIB mag ..., objective ...; probe: DP_FIB_PROBE=..., ..." (read
+    only; also the first probe-current data from this instrument);
+  * FIB imaging on (as before); the magnification (the position's capture mag, 2000x)
+    is set, READ BACK and retried once; the objective is set back to the value in effect
+    before milling (batch: read just before milling, i.e. the recorded value or the
+    autofocus result; Record after image: the position's recorded value, as Go to sets;
+    markup: the overview's) and read back (within 2 V -- read-back precision not yet
+    measured). If either does not read back, the image is SKIPPED with a warning;
+  * after the frame the magnification and imaging mode are read again; a change during
+    the frame renames it <...>_suspect.bmp;
+  * <image>.bmp.json (pyfib.after_image.v1) records the state SmartFIB left, set values,
+    read-backs and the post-frame check; Prepolish / Polish refuse a reference whose
+    recorded magnification is not the position's (images from before v0.53.1 have no
+    sidecar and are accepted as before).
+- tests/test_after_image.py: SmartFIB-reset fake (SEM, 52x, objective moved), 5 new tests.
+
+New in pyFIB v0.53.0 (Mark targets: markup trenches at SEM normal):
+- Evan, 2026-10-10: trenches milled at SEM normal centre the lamella once the grid is
+  tilted down. The standard pattern is Markup_Standard.ely (two 1.04 x ~28 um trenches,
+  27.76 um apart centre to centre, and a tick on the RIGHT trench marking where the
+  lamella goes: midway between the trenches at the tick's height), milled at the
+  correlation magnification, several in one low-mag image.
+- assets/patterns/markup_standard.ely: the operator's Markup_Standard.ely translated so
+  its origin is the lamella point (+172.44075, +55.68713 um); everything else (probe
+  30kV:1.5nA, dose factor 10, depth 10 um, recipe) byte for byte the same.
+- clem/markup.py + CLI `clem-markup`: ONE SmartFIB layout with a copy of the markup on
+  every chosen target, each placed on the FIB overview (x = (px - W/2) ps, y = (H/2 - py)
+  ps), milled with the stage left at the overview position. No stage motion, no stage
+  model, no 400x calibration. Refuses: shapes not 5 um inside the field, any shape within
+  2 um of ANY target in the file (ticked or not), rotated rects / arcs / text / instances
+  / a non-zero frame centre, unreadable numbers. Live, before anything is set: not milling
+  for 5 s, SEM normal, stage still at the overview (X/Y/Z/M 1 um, T/R 0.05 deg), scan
+  rotation 0; then beam shift zeroed + read back 0, FIB magnification = the overview's
+  (read back within 1 %, unreadable refuses), objective = the overview's. The checked
+  bytes are copied to clem/markup/milled/<name>_<time>.ely and THAT copy is milled; one
+  after image at the overview magnification; recorded in clem/pyfib_clem_markups.json.
+- The layout is clem/markup/<overview>_markup.ely (+ .pyfib.json record). Edit in ELYMaker
+  opens it over the overview with the targets drawn in (a same-size PNG copy); an edit
+  saved there is milled AS SAVED -- what it marks is read from its content, every shape is
+  re-checked against every target -- and refused if the targets file or the overview
+  changed since (Reset markup regenerates).
+- Correlation tab, card 4 "Mark targets": Mark column (OK targets ticked, warnings not,
+  refused locked), Markup column, pattern picker, Check markup (dry run), Edit in
+  ELYMaker, Reset markup, Mill markup (ARM + confirm; the CLI refuses unless the layout is
+  exactly the one confirmed, --expect-sha256). Uses the Rough Mill tab's Confirm done.
+- Independent safety review before delivery; its findings are fixed and tested
+  (tests/test_clem_markup.py, 15 tests; GUI smoke test for the card).
+- Visiting targets (go to, site image, centre) moves to a later version.
+
+New in pyFIB v0.52.2 (milling-complete confirmation window in the UI):
+- Rough Mill / Prepolish / Polish tabs: "Confirm done (s)" box next to Wait, default 20 s
+  (range 10-120 s), passed as mill-positions --done-confirm-s. After SmartSEM first reads
+  "milling finished" it must keep reading finished this long before the site counts as
+  done. Was always 30 s from the UI (the CLI default, unchanged). Evan, 2026-10-09.
+- The Log now says how long a false "finished" reading lasted:
+  "[confirm] Completion not stable after N s (window 20 s); continuing to wait." N is the
+  measurement for choosing the window; it must stay well below it.
+- tests/test_done_confirm.py (4 tests); GUI smoke test checks the box on all three tabs.
+
+New in pyFIB v0.52.1 (pyMap v0.9.0 bundled; contract reconciled with it):
+- pyMap v0.9.0 (from the Claude working on pyMap) is bundled UNCHANGED at the pyFIB root:
+  pymap/ (+ VENDORED.txt, README_pyMap.md), its tests in pymap_tests/ (176 pass here),
+  its requirements in requirements-pymap.txt (numpy 1.26.4, scikit-image 0.22.0, ...;
+  only the Correlation tab's Register pane needs them).
+- Correlation tab, Register pane: pyMap now embeds and runs inside the tab.
+  build_widget's positions_file is the file pyMap offers FIB overviews from, so pyFIB
+  passes <session>/clem/overview_positions.json (v0.52.0 passed the milling positions
+  file). pyMap's only interface is build_widget + on_targets_written, so a session change
+  rebuilds the widget (no set_session call). "Hide targets pane" gives pyMap the whole
+  tab; the pane gets ~55 % of the width when pyMap loads; fixed a layout bug that left
+  the embedded widget short (placeholder spacers competed for height).
+- sem_overviews.json now lists overviews under "overviews" (pyMap's key; a v0.52.0 file's
+  "entries" is still read and rewritten) and adds pixel_size_nominal: true,
+  scan_rotation_on (from DP_SCAN_ROT) and tilt_correction_on: null (no such state in the
+  Remote API manual; not probed).
+- Checked end to end: a pyFIB-captured overview -> pyMap's own API writes the targets file
+  (targets_<overview>.json + its content_hash marker) -> pyFIB's plan; pyMap reads pyFIB's
+  SEM overview file. Both refuse a re-captured overview. (tests/test_clem.py, 11.)
+
+New in pyFIB v0.52.0 (CLEM targeting with pyMap, part 1 -- nothing moves to a target):
+- Agreed with Evan and the pyMap plan (project docs claude/pyMap_plan_for_pyFIB.md and
+  claude/pyFIB_review_of_pyMap_plan.md): pyMap does the images, pyFIB the stage.
+- refine.geometry.target_stage_delta: image point (pixels, corner convention, y down) ->
+  stage X/Y move that centres it, with refine's measured signs and tilt model. Refuses
+  outside the model (tilt -1..31, R 12 +/- 1), with scan rotation > 0.05 deg or beam
+  shift > 0.01 um. Regression: 323.3 px right at 2000x/tilt 30 -> X -19.78 um; 309.9 px
+  up -> Y -20.00 um (the 2026-09-22 calibration).
+- smartfib_executor/clem: limits (one place for the safety numbers), targets (read and
+  check pyMap's pymap.targets.v2 + its pymap.ready.v1 marker, plan stage X/Y; files only),
+  overview (FIB / SEM overview capture), cli.
+- clem-targets (files only): ready marker and hash; exactly one fib_position source
+  (tile-ready format, tiling later); the overview record's image hash / size / pixel size
+  / capture time / stage echo; <= 30 targets, unique ids; each target inside the overview
+  image and convertible (no scan rotation / beam shift on the overview); registration
+  error (grid-plane value when given) warn > 1 um, refuse > 3 um unless --accept-qc
+  (recorded). Writes <session>/clem/pyfib_clem_plan.json (pyfib.clem_targets.v1; move
+  axes "XY"). Reports whether the overview magnification's stage scale is measured: a
+  refine --calibrate-stage at that mag (+/-5 %) and tilt (+/-1 deg) within 3 % of the
+  model; until then "UNVERIFIED" and visits stay off (v0.53.0).
+- clem-overview --kind fib|sem --grid Grid1|Grid2 (dry run unless --arm): refuses unless
+  SmartSEM reads not-milling for 5 s and the stage is at SEM normal (T 29-31, R 12 +/- 1);
+  never moves the stage. FIB: zero beam shift (refuse if it will not read 0), capture
+  400x, 1024 x 768, no 800x frame -> clem/overview_positions.json (clem_ov_<grid>_<n>).
+  SEM (Evan: pyFIB grabs it and records the stage): CMD_FIB_MODE_SEM, AP_MAG, one fresh
+  frame -> clem/sem_overviews.json (pyfib.sem_overviews.v1: stage, field size, nominal
+  pixel size AP_WIDTH/width, AP_PIXEL_SIZE for the log, WD, EHT, detector, scan rotation,
+  tilt-correction angle); only AP_MAG / DP_FREEZE_ON set and SEM-mode / freeze commands
+  sent (guarded); warns when the store size differs from the grab.
+- Correlation tab (after GISDEP): Targets pane (Go to grid = existing setup move via CLEM
+  SAFE; Coincidence check = existing measure-and-recommend, no Z move; Capture FIB / SEM
+  overview; targets table with stage X/Y, offset, status, reasons; Check targets writes
+  the plan; auto-refresh when pyMap writes) and Register pane (pyMap embedded through
+  pymap.gui.embed.build_widget when installed next to pyFIB; a note otherwise; an
+  unrelated PyPI 'pymap' is ignored). run_module(show_log=False) added.
+- Tests: tests/test_clem.py (9), GUI 32/32 (+1). Test sheet test_scripts/CLEM_OVERVIEW_TEST.txt.
+
 New in pyFIB v0.51.2 (report, Evan 2026-10-07):
 - Position details: "Residual" header over the residual column of the pattern lines;
   Stage line labelled "X ... · Y ... · Z ... mm · T ... · R ..."; FIB line = "Mag 2000x ·
@@ -2338,4 +2814,4 @@ __all__ = [
     "mill_positions_sequential",
 ]
 
-__version__ = "0.51.2"
+__version__ = "0.55.1"

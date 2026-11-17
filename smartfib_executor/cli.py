@@ -6,14 +6,24 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .batch import mill_positions_sequential, natural_position_sort
-from .milling_workflow import AutofocusConfig, RefineConfig
+from .batch import BatchStopped, mill_positions_sequential, natural_position_sort
+from .milling_workflow import AutofocusConfig, RefineConfig, refine_scan_rates
 from .pattern_ely import ELayoutPattern
 from .positions import PositionDatabase, capture_position, recall_position
 from .runner import PatternJob, PatternRunner
 from .smartsem_com import SmartSEM
 from .tilt_guard import (BATCH_TILT_LIMIT_DEG, TiltLimitError, plan_batch_tilts,
                          read_live_tilt)
+
+
+def _refine_rates_kw(args) -> dict:
+    """v0.54.0: RefineConfig speed fields from --refine-scan-rate /
+    --refine-fallback-scan-rate (None = the stage default) and --imaging-scan-rate."""
+    img = int(getattr(args, "imaging_scan_rate", 8))
+    rate, fb = refine_scan_rates(getattr(args, "stage", None), None if img < 0 else img,
+                                 getattr(args, "refine_scan_rate", None),
+                                 getattr(args, "refine_fallback_scan_rate", None))
+    return {"imaging_scan_rate": rate, "fallback_scan_rate": fb}
 
 
 def _project_root() -> Path:
@@ -160,10 +170,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             # FIRST, then set + read back -- a set issued in post-milling mode does
             # not stick (SmartFIB keeps separate imaging/milling mags).
             target = float(fib_mag)
+            # v0.54.0 (bug #14): the shared switch -- only if not already in FIB imaging,
+            # then wait until SmartSEM's magnification reset has landed.
+            from .frame_grab import ensure_fib_imaging
             try:
-                sem.execute("CMD_FIB_MODE_FIB")
-            except Exception:
-                pass
+                ensure_fib_imaging(sem, log=print)
+            except Exception as e:  # noqa: BLE001
+                print(f"ERROR: could not switch to FIB imaging ({e}); refusing to mill.",
+                      file=sys.stderr)
+                return 1
             ok = False
             actual = None
             for _ in range(2):
@@ -259,7 +274,7 @@ def cmd_capture_position(args: argparse.Namespace) -> int:
             unfreeze_before_grab=not bool(getattr(args, "no_unfreeze_before_grab", False)),
             freeze_after_grab=not bool(getattr(args, "no_freeze_after_grab", False)),
             frame_wait_s=float(getattr(args, "frame_wait_s", 3.0)),
-            frozen_timeout_s=float(getattr(args, "frozen_timeout_s", 30.0)),
+            frozen_timeout_s=float(getattr(args, "frozen_timeout_s", 60.0)),
             coarse_magnification_x=getattr(args, "coarse_mag", None),
             coarse_scan_rate=getattr(args, "coarse_scan_rate", 5),
         )
@@ -351,6 +366,12 @@ def cmd_debug_fib_imaging(args: argparse.Namespace) -> int:
         'DP_EXT_SCAN_CONTROL',
         'DP_PANEL_DISABLE',
         'DP_STAGE_IS',
+        # v0.54.0 (read only): the FIB magnification reset after a switch (bug #14) and
+        # the single-frame protocol's inputs.
+        'AP_FIB_MAGNIFICATION',
+        'AP_FRAME_TIME',
+        'DP_SCANRATE',
+        'DP_FREEZE_ON',
     ]
 
     def emit(line: str) -> None:
@@ -759,6 +780,10 @@ def cmd_mill_positions(args: argparse.Namespace) -> int:
             print(f'  - Tilt limit: a position is milled only if its recorded tilt is within '
                   f'{BATCH_TILT_LIMIT_DEG:g} deg of the current stage tilt (and of the previous '
                   f'site). Checked against the live tilt when armed; --tilt-check shows it now.')
+        _to = float(args.timeout)
+        print('  - Mill timeout: ' + (f'{_to / 60.0:g} min per site' if _to > 0 else 'none')
+              + ' (--timeout). A site that mills longer ends as an error; pyFIB does NOT stop '
+                'the pattern and leaves the beam shift alone while it runs.')
         print('  - For each position: move stage -> set objective -> [autofocus] -> [refine] -> load/prepare -> start milling -> wait -> next')
         if args.mode_mill and (not args.no_mode_mill):
             print('  - (Would also force CMD_FIB_MODE_MILL before each milling run)')
@@ -780,6 +805,13 @@ def cmd_mill_positions(args: argparse.Namespace) -> int:
         if run_log is not None:
             run_log.finish("stopped", "interrupted (Ctrl+C)")
         raise
+    except BatchStopped as e:
+        # v0.55.1: the batch stopped itself before a stage move (the pyFIB window that
+        # started it is gone). Recorded as stopped, not as an instrument error.
+        print(f"*** Batch stopped: {e} ***")
+        if run_log is not None:
+            run_log.finish("stopped", str(e))
+        return 5
     except BaseException as e:
         if run_log is not None:
             run_log.finish("error", f"{type(e).__name__}: {e}")
@@ -813,6 +845,7 @@ def _open_run_log(args, pos_file, db, names, ely_local, af_set, rf_set):
                 "record_fiducial": getattr(args, "record_fiducial", None),
                 "continue_on_error": bool(args.continue_on_error),
                 "wait": args.wait,
+                "timeout_s": float(getattr(args, "timeout", 0) or 0),
                 "after_image": _after_image_on(args),
                 "stage": getattr(args, "stage", None),
                 "accept_reference_skips": sorted(_names_csv(
@@ -921,6 +954,7 @@ def _mill_positions_armed(args, db, names, ely_local, af_set, rf_set, pos_file, 
                 return 2
             for line in plan.table_lines():
                 print(line)
+            print(plan.machine_line())          # v0.53.3: the GUI reads this (one connection)
             excluded = plan.excluded
             missing = [n for n in excluded if n not in skip_ok]
             if missing:
@@ -987,8 +1021,9 @@ def _mill_positions_armed(args, db, names, ely_local, af_set, rf_set, pos_file, 
                 abort_on_failure=bool(getattr(args, "refine_abort_on_fail", False)
                                       or getattr(args, "stage", None) in ("prepolish", "polish")),
                 coarse_fallback=not bool(getattr(args, "no_refine_coarse_fallback", False)),
-                imaging_scan_rate=(None if int(getattr(args, "imaging_scan_rate", 8)) < 0
-                                   else int(getattr(args, "imaging_scan_rate", 8))),
+                # v0.54.0: refine has its own speed (Prepolish / Polish 3, fallback 8);
+                # --imaging-scan-rate stays the autofocus speed (and Rough's refine).
+                **_refine_rates_kw(args),
                 scan_rate_method=getattr(args, "scan_rate_method", "set"),
             ),
             ref_base_dir=pos_file.parent,
@@ -1006,6 +1041,39 @@ def _mill_positions_armed(args, db, names, ely_local, af_set, rf_set, pos_file, 
 # ----------------------------
 # Manual milling at one position (v0.51.0, site_ops.py)
 # ----------------------------
+
+def cmd_milling_check(args: argparse.Namespace) -> int:
+    """v0.53.5: read-only. Print the three milling flags (text and number) and what the
+    manual buttons' milling check decides. Sends nothing to the microscope."""
+    from .batch import milling_state
+
+    def _read(sem, m):
+        try:
+            t = str(sem.get_str(m)).strip()
+        except Exception as e:  # noqa: BLE001
+            t = f"<unreadable: {e}>"
+        try:
+            n = sem.get_float(m)
+        except Exception as e:  # noqa: BLE001
+            n = f"<unreadable: {e}>"
+        return t, n
+
+    with SmartSEM() as sem:
+        if args.connect == "local":
+            sem.connect_local(args.machine)
+        else:
+            sem.connect_remoting()
+        for m in ("DP_FIB_MODE", "DP_FIB_IMAGING", "DP_PATTERNING_MODE"):
+            t, n = _read(sem, m)
+            print(f"  {m:<20} text {t!r:<16} number {n}")
+        active, why = milling_state(sem, snapshot_ok=True)
+        print(("MILLING: the manual buttons would refuse -- " if active else
+               "NOT MILLING: the manual buttons would proceed -- ") + why)
+        active, why = milling_state(sem)
+        print(("MILLING: a batch would wait before its next stage move -- " if active else
+               "NOT MILLING: a batch would move on -- ") + why)
+    return 0
+
 
 def cmd_site(args: argparse.Namespace) -> int:
     """site goto|align|push|after-image NAME --stage S: one manual step at one position."""
@@ -1076,9 +1144,8 @@ def cmd_site(args: argparse.Namespace) -> int:
                              stage_timeout_s=float(args.stage_timeout_s))
                 print(f"SITE-DONE: goto {rec.name}")
             elif action == "align":
-                rate = int(args.imaging_scan_rate)
                 cfg = RefineConfig(enable_stage=bool(args.refine_enable_stage),
-                                   imaging_scan_rate=None if rate < 0 else rate,
+                                   **_refine_rates_kw(args),
                                    scan_rate_method=args.scan_rate_method)
                 res = SO.site_align(sem, rec, stage, session, cfg)
                 ok = bool(res is not None and getattr(res, "success", False))
@@ -1292,8 +1359,8 @@ def build_parser(prog_name: str = "pyfib") -> argparse.ArgumentParser:
         "--frame-wait-s",
         type=float,
         default=3.0,
-        help="Frame-safe grab: minimum seconds of live scan before freezing at end of "
-             "frame (the DP_FROZEN wait then guarantees the frame completed). Default: 3.0",
+        help="Single-frame grab (v0.54.0): used ONLY if DP_FROZEN is unreadable -- the "
+             "wait before Grab() is then max(this, 1.2 x AP_FRAME_TIME + 0.3 s). Default: 3.0",
     )
     p_cap.add_argument(
         "--coarse-mag",
@@ -1312,8 +1379,9 @@ def build_parser(prog_name: str = "pyfib") -> argparse.ArgumentParser:
     p_cap.add_argument(
         "--frozen-timeout-s",
         type=float,
-        default=30.0,
-        help="Frame-safe grab: maximum seconds to wait for DP_FROZEN. Default: 30",
+        default=60.0,
+        help="Single-frame grab (v0.54.0): maximum seconds to wait for DP_FROZEN when "
+             "AP_FRAME_TIME is unreadable (otherwise 2 x AP_FRAME_TIME). Default: 60",
     )
     p_cap.add_argument(
         "--include-tilt",
@@ -1393,6 +1461,15 @@ def build_parser(prog_name: str = "pyfib") -> argparse.ArgumentParser:
     )
     _add_common_connection_args(p_dbg)
     p_dbg.set_defaults(func=cmd_debug_fib_imaging)
+
+    # ---- milling-check (v0.53.5, read-only)
+    p_mc = sub.add_parser(
+        'milling-check',
+        help='Read-only: print DP_FIB_MODE / DP_FIB_IMAGING / DP_PATTERNING_MODE and whether '
+             'the manual buttons would treat SmartSEM as milling. Sends nothing.',
+    )
+    _add_common_connection_args(p_mc)
+    p_mc.set_defaults(func=cmd_milling_check)
 
 
     # ---- list-positions
@@ -1769,9 +1846,17 @@ def build_parser(prog_name: str = "pyfib") -> argparse.ArgumentParser:
                            'site and after every site, so a refine correction never '
                            'carries into the next position.')
     p_mp.add_argument('--imaging-scan-rate', type=int, default=8,
-                      help='DP_SCANRATE for autofocus/refine frames (higher = more '
-                           'dwell = better SNR). Use -1 to leave the scan rate as-is. '
-                           'Milling dwell is unaffected.')
+                      help='DP_SCANRATE for autofocus frames, and for refine frames in '
+                           'Rough (higher = more dwell = better SNR). Use -1 to leave the '
+                           'scan rate as-is. Milling dwell is unaffected.')
+    p_mp.add_argument('--refine-scan-rate', type=int, default=None,
+                      help='v0.54.0: DP_SCANRATE for refine frames. Default: 3 for '
+                           'prepolish / polish, --imaging-scan-rate otherwise. -1 = leave '
+                           'the scan rate as-is.')
+    p_mp.add_argument('--refine-fallback-scan-rate', type=int, default=None,
+                      help='v0.54.0: if the 2000x refine cannot correlate, retry it once at '
+                           'this speed before the 800x fallback. Default: 8 for prepolish '
+                           '/ polish, none otherwise. -1 = no speed retry.')
     p_mp.add_argument('--scan-rate-method', choices=('set', 'cmd', 'set_then_cmd'),
                       default='cmd',
                       help="How to change DP_SCANRATE (which is READ-ONLY on this "
@@ -1819,7 +1904,14 @@ def build_parser(prog_name: str = "pyfib") -> argparse.ArgumentParser:
     p_site.add_argument('--refine-enable-stage', action='store_true',
                         help='align: allow one X/Y stage move (<= 100 um) when the drift '
                              'exceeds the beam-shift window.')
-    p_site.add_argument('--imaging-scan-rate', type=int, default=8)
+    p_site.add_argument('--imaging-scan-rate', type=int, default=8,
+                        help='align: refine speed in Rough (see --refine-scan-rate).')
+    p_site.add_argument('--refine-scan-rate', type=int, default=None,
+                        help='align (v0.54.0): refine speed. Default: 3 for prepolish / '
+                             'polish, --imaging-scan-rate for rough. -1 = as-is.')
+    p_site.add_argument('--refine-fallback-scan-rate', type=int, default=None,
+                        help='align (v0.54.0): retry speed if the 2000x refine cannot '
+                             'correlate. Default: 8 for prepolish / polish. -1 = none.')
     p_site.add_argument('--scan-rate-method', choices=('set', 'cmd', 'set_then_cmd'),
                         default='cmd')
     p_site.add_argument('--smartfib-drop-dir', default=r'C:\ProgramData\Carl Zeiss\SmartFIB\API\Drop')
@@ -1832,6 +1924,10 @@ def build_parser(prog_name: str = "pyfib") -> argparse.ArgumentParser:
                         help='Actually execute on the instrument. Without it: dry run.')
     _add_common_connection_args(p_site)
     p_site.set_defaults(func=cmd_site)
+
+    # ---- clem-targets / clem-overview (v0.52.0, CLEM targeting with pyMap)
+    from .clem.cli import add_parsers as _add_clem_parsers
+    _add_clem_parsers(sub, _add_common_connection_args)
 
     # ---- ui
     p_ui = sub.add_parser(
@@ -1856,11 +1952,36 @@ def build_parser(prog_name: str = "pyfib") -> argparse.ArgumentParser:
     return p
 
 
+def _enable_fault_log() -> None:
+    """v0.53.3: a hard crash (e.g. an access violation inside the ZEISS API) leaves a
+    Python stack in <pyFIB>/logs/pyfib_faults.log. Best effort."""
+    try:
+        import faulthandler
+        import time as _t
+        d = _project_root() / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        f = open(d / "pyfib_faults.log", "a", encoding="utf-8")
+        f.write(f"\n=== CLI {' '.join(sys.argv[1:3])} {_t.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        f.flush()
+        faulthandler.enable(f, all_threads=True)
+        globals()["_FAULT_FILE"] = f
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv=None, prog_name: str = "pyfib") -> int:
+    # v0.55.1: a closed output pipe (the pyFIB window died) can no longer raise inside a
+    # command; a batch stops at its next safe point instead (see safe_output.py).
+    try:
+        from .safe_output import install as _install_safe_output
+        _install_safe_output()
+    except Exception:  # noqa: BLE001
+        pass
     p = build_parser(prog_name=prog_name)
     args = p.parse_args(argv)
     return int(args.func(args))
 
 
 if __name__ == "__main__":
+    _enable_fault_log()                 # v0.53.3: only for the real command line
     raise SystemExit(main())

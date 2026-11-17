@@ -1,0 +1,78 @@
+CLEM PART 1: CORRELATION TAB, OVERVIEWS, 400x SCALE (pyFIB v0.52.1)      about 30 min
+==============================================================================
+
+What is new
+  * Correlation tab (after GISDEP). Nothing in it moves the stage to a target yet.
+  * Capture FIB overview: zeroes the FIB beam shift, then one FIB frame at 400x,
+    1024 x 768, no 800x frame -> <session>\clem\overview_positions.json.
+  * Capture SEM overview: pyFIB switches to SEM imaging, sets the magnification, grabs
+    one frame and records the stage with it -> <session>\clem\sem_overviews.json.
+    Detector, scan speed, brightness and contrast stay as you set them in SmartSEM.
+  * Both refuse unless the stage is at SEM normal (T 29-31, R 12) and SmartSEM is not
+    milling (watched for 5 s). Neither moves the stage.
+  * Targets from pyMap (when it writes them into <session>\clem) are checked and listed
+    with their stage X/Y. Files only.
+
+Stop and send the Log text if anything moves when it should not.
+
+
+0) pyMap's packages (once)                                                3 min
+   pyMap is bundled (pymap folder). If the right side of the Correlation tab says pyMap
+   could not start, install its packages from the pyFIB folder:
+     python -m pip install -r requirements-pymap.txt
+   Optional check:  python -m pytest pymap_tests   (176 should pass)
+
+
+1) DRY RUN, ARM OFF                                                       2 min
+   Correlation tab: Go to grid, Coincidence check, Capture FIB overview, Capture SEM
+   overview. Each prints its plan in the Log ([DRY RUN] ...); Coincidence check runs on
+   the simulator. pyMap's window fills the right side ("Hide targets pane" gives it the
+   whole tab).
+
+
+2) GO TO GRID, ARM ON                                                     3 min
+   Grid1 -> Go to grid -> confirm. Same move as Setup -> Grid1 GIS Normal (via CLEM
+   SAFE). Check SmartSEM reads T 30, R 12 at the end.
+
+
+3) COINCIDENCE CHECK, ARM ON                                              2 min
+   Coincidence check. It autofocuses the SEM and RECOMMENDS a Z move; it moves nothing.
+   Make the Z move by hand if needed (or with Setup -> Adjust as before).
+
+
+4) FIB OVERVIEW, ARM ON (one FIB frame of dose over the whole field)      3 min
+   Capture FIB overview (400x) -> confirm.
+   Expect: the beam shift reads 0 in SmartSEM afterwards; one frame; the Log ends with
+   "CLEM-OVERVIEW: fib clem_ov_grid1_1 images/clem_ov_grid1_1.bmp"; the tab lists
+   "FIB clem_ov_grid1_1 (400x)". Open the BMP: it should show the grid area you expect.
+   Refusal check (optional): tilt to 25 deg and try again -> "REFUSED ... SEM normal",
+   nothing changes. Tilt back.
+
+
+5) SEM OVERVIEW, ARM ON                                                   3 min
+   Set the SEM detector / brightness / contrast as you like in SmartSEM. Capture SEM
+   overview (200x) -> confirm.
+   Expect: SEM imaging comes on, one frame, the Log ends with "CLEM-OVERVIEW: sem
+   clem_sem_grid1_1 ...", scan left frozen.
+   Please send <session>\clem\sem_overviews.json and the BMP. If the Log warns "the
+   store size differs from the grab", note your SmartSEM store resolution.
+   Pixel size check: measure the grid bar pitch in pixels on the BMP; pitch (um) / pixels
+   should match "pixel_size_m" in the JSON (it is AP_WIDTH / 1024, not yet verified).
+
+
+6) 400x STAGE SCALE AT +30 (measurement for visiting targets)             8 min
+   This MOVES the stage 50 um in X, then Y, and returns (asks "Proceed? yes"). Use a
+   sacrificial area at Grid1, T 30, R 12. Command prompt in the pyFIB folder:
+
+     python -m smartfib_executor.refine --calibrate-stage --magnification 400 --stage-test-step-um 50 --save-calibration --stage-calibration-file refine_stage_calibration_400x_T30.json
+
+   Send the printed summary and the JSON. Keep the file in the pyFIB folder: the
+   Correlation tab then shows "scale: verified at 400x" (within 3 % of the model) and
+   visits can be enabled in the next version.
+
+
+7) TARGETS FROM pyMap (after 4, optional confocal)
+   In pyMap (right side): Open FIB overview (pyFIB) -> clem_ov_grid1_1, open a confocal,
+   pick landmarks (4+ pairs for affine) and targets, Write targets for pyFIB. The table on
+   the left fills in by itself; Check targets (write plan) writes pyfib_clem_plan.json.
+   The stage X/Y shown are where a visit WOULD go; nothing moves.

@@ -170,6 +170,7 @@ def test_cli_armed_needs_the_ok_and_mills_only_the_rest():
     base = ["mill-positions", str(ely), "--positions-file", str(pf), "--arm"]
     rc, cap, out = _cli(base, _Sem([1.97]))                        # GUI / pipe: no prompt
     assert rc == 3 and cap == {} and "--accept-tilt-skips p2" in out, out
+    assert "TILT-CHECK: live=1.9700" in out and "excluded=p2" in out   # v0.53.3: GUI reads it
     run = json.loads(sorted((d / "runs").glob("run_*.json"))[-1].read_text())
     assert run["status"] == "stopped" and "nothing moved" in run["message"]
     rc, cap, out = _cli(base, _Sem([1.97]), tty=True)              # terminal, answers "n"

@@ -101,3 +101,36 @@ def rounded_rect_polygon(x: float, y: float, width: float, height: float,
         else:
             pts.append(C)
     return pts
+
+
+# --------------------------------------------------------------------------- #
+# Rotated RECT geometry (pyFIB patch 0.9.1+pyfib.1, 2026-10-20)
+# --------------------------------------------------------------------------- #
+# MEASURED in SmartFIB (Crossbeam 550, 2026-10-20, pyFIB_rotation_test.ely: 12 x 2 um
+# bars at 30 deg, one with height +2 and one with height -2): SmartFIB rotates a RECT
+# about the CENTRE of its unrotated box, COUNTER-CLOCKWISE for a positive angle (layout
+# y up, as SmartFIB displays it). The box itself is unchanged by the angle: it runs
+# from the anchor (x, y) by the signed width and height. Confirmed on 8 milled waffle
+# sites (2026-10-16): the 270 deg hinge slots were milled at the centre-pivot places.
+# Before this patch elymaker drew rotated RECTs CLOCKWISE about the anchor.
+
+
+def rect_center(x: float, y: float, width: float, height: float) -> Tuple[float, float]:
+    """Centre of a RECT's box in layout um (the rotation pivot)."""
+    return (x + width / 2.0, y + height / 2.0)
+
+
+def rect_corners(x: float, y: float, width: float, height: float,
+                 angle_deg: float = 0.0) -> List[Tuple[float, float]]:
+    """The four corners of a RECT in layout um (y up), as SmartFIB places them.
+
+    Vertex order is SmartFIB's (P0=(x,y), P1=(x+w,y), P2=(x+w,y+h), P3=(x,y+h)),
+    each rotated counter-clockwise by ``angle_deg`` about the box centre."""
+    cx, cy = rect_center(x, y, width, height)
+    a = math.radians(float(angle_deg))
+    ca, sa = math.cos(a), math.sin(a)
+    out = []
+    for px, py in ((x, y), (x + width, y), (x + width, y + height), (x, y + height)):
+        dx, dy = px - cx, py - cy
+        out.append((cx + dx * ca - dy * sa, cy + dx * sa + dy * ca))
+    return out

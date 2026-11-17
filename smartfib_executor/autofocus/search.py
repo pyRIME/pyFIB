@@ -100,6 +100,17 @@ def autofocus(
             except Exception:
                 result.working_distance_m = None
         return result
+    except Exception:
+        # v0.54.0 review: a frame the sweep must not use (StaleFrameError) or a column
+        # change during a frame now raises mid-sweep; put the objective back to where the
+        # sweep started rather than leave it at the last sweep voltage.
+        try:
+            source.set_voltage(source.initial_voltage())
+            log(f"[autofocus] stopped by an error; objective put back to "
+                f"{source.initial_voltage():.1f} V.")
+        except Exception as e:  # noqa: BLE001
+            log(f"[autofocus] WARNING: could not put the objective back ({e!r}).")
+        raise
     finally:
         source.restore()
 

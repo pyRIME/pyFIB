@@ -435,6 +435,9 @@ and keeps the operator's originals for `restore()`); `restore()` ends with `_pau
 All three pages are `pages.MillPage(window, title, stage)` with identical options for now
 (each builds its own `mill-positions` argv, with the v0.46.0 tilt check when armed).
 `MainWindow.mill_pages()` returns them in order.
+v0.52.2: each page has `done_confirm_spin` ("Confirm done (s)", `DONE_CONFIRM_DEFAULT_S`
+20, range 10-120 in pages.py) -> `--done-confirm-s`; the CLI default stays 30 s.
+`PatternRunner._confirm_done_stable` logs the duration of a false "done" reading.
 
 
 ## Milling stages: Rough Mill -> Prepolish -> Polish (v0.51.0)
@@ -480,3 +483,98 @@ the summary table. `_patterns_section` collects every pattern used (per stage, s
 authored) and renders `pattern_diagram.pattern_card` (drawing + `parts_table_compact`).
 Figure keys are per view (`pv v-<view>` spans, shown by the same `data-view` CSS as the
 images). `#plist` + `body.two-up` = two positions per row (default; toolbar toggle).
+
+## CLEM targeting with pyMap (v0.52.0, part 1)
+
+`smartfib_executor/clem/` -- pyMap does the images, pyFIB the stage (agreed plan in the
+project docs). Files live in `<session>/clem/`, never in the milling `positions.json`:
+`overview_positions.json` (FIB overviews, PositionRecords), `sem_overviews.json`
+(`pyfib.sem_overviews.v1`), `images/`, pyMap's `<name>.json` (`pymap.targets.v2`) +
+`<name>.json.ready.json` (`pymap.ready.v1`, `sha256`), and pyFIB's
+`pyfib_clem_plan.json` (`pyfib.clem_targets.v1`).
+
+* `refine.geometry.target_stage_delta` is the only pixel -> stage conversion: offset from
+  the image centre x pixel size = refine "drift" -> `stage_correction`; refuses outside
+  `stage_model_applies`, scan rotation > 0.05 deg, beam shift > 0.01 um.
+* `clem.targets.plan_targets` (files only): file checks (ready marker/hash, one source,
+  record echoes, <= 30 unique targets, registration error limits) then per target
+  (inside the image, convertible). Stage X/Y = overview X/Y + delta; Z/T/R/M are never
+  part of a visit move. Scale check: a `refine_stage_calibration*.json` at the overview
+  mag/tilt within 3 % of the model.
+* `clem.overview`: SEM-normal check (T 29-31, R 12 +/- 1) + 5 s not-milling window, then
+  FIB (beam shift zeroed, `capture_position` at 400x, no coarse) or SEM (`_SemOnly`
+  guard; `frame_grab.grab_fresh_frame`). Neither moves the stage.
+* `gui_qt/correlation_page.py`: Targets pane + Register pane (`find_pymap` uses
+  `find_spec("pymap")` without importing and requires a `gui/` folder; embeds
+  `pymap.gui.embed.build_widget(parent, session_dir=, positions_file=, on_targets_written=)`;
+  calls `set_session(...)` on it after a session change if it has one).
+* Safety numbers: `clem/limits.py`.
+
+v0.52.1: pyMap v0.9.0 is vendored at the root (`pymap/`, `pymap_tests/`,
+`requirements-pymap.txt`); replace the folder as a whole on a pyMap update. The Register
+pane passes `positions_file=<session>/clem/overview_positions.json` and rebuilds the
+widget on a session change. `sem_overviews.json` list key: `"overviews"`.
+
+v0.53.0, `clem/markup.py` (Mark targets): a markup .ely's origin is the lamella point;
+`assets/patterns/markup_standard.ely` = the operator's Markup_Standard translated by
+(+172.44075, +55.68713) um. `plan_markup(tplan, base, selected)` -> per target the layout
+offset (`pixel_to_layout_um`, elymaker's ImageCalibration convention) and checks
+(`check_shapes`: 5 um inside the field, 2 um clear of every target point).
+`prepare_file` writes `<session>/clem/markup/<ov>_markup.ely` (`combine`: text-level
+copies, only RECT x/y and POLYGON points change, self-checked) + `.pyfib.json` (generated
+sha + inputs): generated -> regenerated on input change; edited (sha differs) -> kept,
+targets from `match_markups` (content), refused if targets file / overview changed; no
+record -> refused. `mill_markup`: read-only checks (guard, SEM normal,
+`check_at_overview`, scan rotation) -> private copy in `markup/milled/` -> beam shift 0 ->
+`_set_fib_mag` (read-back required) -> objective -> one `PatternJob` -> after image ->
+`pyfib_clem_markups.json` (`pyfib.clem_markups.v1`). CLI `clem-markup` (`--expect-sha256`
+binds the GUI confirm to the layout). GUI: `CorrelationPage` card 4 (`T_MARK`,
+`T_MARKUP`, `markup_plan`, `refresh_markup`, `markup_argv`). Limits: `MARKUP_*` in
+`clem/limits.py`.
+
+
+## After-mill image checks (v0.53.1)
+
+`after_image.grab_after_mill_image(..., objective_v=)` (batch, `site after-image`, markup):
+`smartfib_state()` logged first (imaging, FIB mag, objective, `PROBE_READS`), then FIB
+mode, magnification set + read back (retry once, 1 %), objective set + read back
+(`OBJECTIVE_TOL_V` 2 V, unmeasured), grab, post-frame mag/imaging check (`_suspect` on
+change), sidecar `<image>.bmp.json` (`pyfib.after_image.v1`). `mill_stages.reference_for_stage`
+calls `after_image.meta_problem` (wrong recorded magnification -> not a reference). The
+batch reads `AP_FIB_OBJECTIVE_POTENTIAL` just before `runner.run` as `objective_v`.
+
+
+## Embedded tools and GUI errors (v0.53.2)
+
+`gui_qt/embedding.py`: `contain(w)` (size policy Ignored, so an embedded window's
+minimum size never becomes pyFIB's), `scroll_docks(win, names)` (dock panels in
+QScrollAreas, from outside), `share_dock_column(win, upper, tabbed)` (tabify + resizeDocks;
+ELYMaker: Tools above, Properties | New-shape defaults tabbed, Properties raised on
+selection), `Detachable` (moves the same widget into a `_ToolWindow` and back on close;
+`listeners` get detached True/False). Used by `pages.ElymakerTab` and
+`correlation_page.RegisterPane` (rebuild on session change re-detaches).
+`gui_qt/errors.install(get_window, log_dir)`: sys/threading excepthook -> Log tab +
+`logs/pyfib_gui_errors.log` + warning box; faulthandler -> `logs/pyfib_faults.log`.
+Installed by `gui_qt.app.main` only (tests install it explicitly).
+
+
+## One SmartSEM client at a time (v0.53.3)
+
+`smartsem_com.other_api_clients()` (tasklist /V CSV, python.exe + pythonw.exe, window title
+"Remoting Forwarding Window", excluding this process and its parent) and
+`wait_for_other_api_clients(wait_s)`; `SmartSEM(client_wait_s=20)` calls it before
+CoInitialize/Dispatch (GISDEP tab: 0). `MillPage._on_start` armed: one `mill-positions
+--arm` run (`_on_armed_line` / `_after_armed`); on exit 3 + "[tilt] Refusing" +
+TILT-CHECK exclusions it reuses `_after_tilt_check` to ask and re-run with
+`--accept-tilt-skips`. `cli._enable_fault_log()` from `__main__` (and `pyfib/__main__`).
+
+
+## Capture: new frame at the right magnification (v0.53.4)
+
+`frame_grab.wait_live` (DP_FROZEN must read Live after CMD_UNFREEZE_ZONE; one resend;
+`SCAN_NOT_RESTARTED` warning otherwise), `frame_grab.set_fib_mag_checked` /
+`read_fib_mag`. `positions.capture_position`: fine mag read back before (refuse) and after
+(refuse, `_suspect`); stale fine frame refused; coarse: read back before/after, byte-
+identical-to-fine or stale -> one retry -> no coarse (`_coarse_suspect.bmp`); restore with
+read-back. `clem.overview.capture_sem_overview` and `after_image` treat
+`SCAN_NOT_RESTARTED` as stale.

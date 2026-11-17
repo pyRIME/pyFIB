@@ -34,6 +34,8 @@ except Exception:  # pragma: no cover
 
 from .geometry import BEAM_SHIFT_MAX_M, pixel_size_m
 
+from ..frame_grab import SCAN_RATE_SETTLE_S   # v0.54.0: after a speed change, before a frame
+
 
 class RefineScope:
     """Interface implemented by the simulator and the real adapter."""
@@ -73,6 +75,10 @@ class RefineScope:
         """(tilt_deg, rot_deg) of the stage, read LIVE (the stage model is tilt-
         dependent and valid only at the calibration rotation)."""
         raise NotImplementedError
+
+    def restore_scan_rate(self) -> None:
+        """v0.54.0: put back the scan rate the refine sequence started with (no-op here)."""
+        return None
 
     def ensure_magnification(self, magnification: float) -> None:
         """Leave the instrument at this magnification (e.g. restore the fine mag after
@@ -274,26 +280,13 @@ class SimulatedRefineScope(RefineScope):
 # --------------------------------------------------------------------------- #
 # Real instrument adapter (NOT yet validated on the microscope)
 # --------------------------------------------------------------------------- #
-def _ensure_fib_imaging(sem, timeout_s: float = 60.0, poll_s: float = 0.25) -> None:
-    def _state():
-        try:
-            return sem.get_str("DP_FIB_IMAGING").strip()
-        except Exception:
-            return None
-
-    if (_state() or "").upper() != "FIB":
-        sem.execute("CMD_FIB_MODE_FIB")
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if (_state() or "").upper() == "FIB":
-                return
-            try:
-                if int(round(float(sem.get_float("DP_FIB_IMAGING")))) == 1:
-                    return
-            except Exception:
-                pass
-            time.sleep(poll_s)
-        raise TimeoutError("timed out waiting for DP_FIB_IMAGING=FIB")
+def _ensure_fib_imaging(sem, timeout_s: float = 60.0, poll_s: float = 0.25,
+                        log=None) -> None:
+    """v0.54.0: the shared switch (frame_grab.ensure_fib_imaging, bug #14): switch only
+    if not already in FIB imaging, then let SmartSEM's magnification reset land before
+    the magnification is set."""
+    from ..frame_grab import ensure_fib_imaging
+    ensure_fib_imaging(sem, timeout_s=timeout_s, poll_s=poll_s, log=log)
 
 
 def _read_scan_rate(sem) -> Optional[int]:
@@ -347,41 +340,14 @@ def _apply_scan_rate(sem, rate: Optional[int], method: str, log) -> Optional[int
     return orig
 
 
-def _is_frozen(sem) -> Optional[bool]:
-    try:
-        v = sem.get_str("DP_FROZEN").strip().lower()
-        if v in ("frozen", "1", "yes"):
-            return True
-        if v in ("live", "0", "no"):
-            return False
-    except Exception:
-        pass
-    try:
-        return int(round(float(sem.get_float("DP_FROZEN")))) == 1
-    except Exception:
-        return None
-
-
-def _wait_frozen(sem, timeout_s: float, poll_s: float = 0.2, log=None) -> None:
-    """Block until DP_FROZEN reports Frozen, i.e. the (possibly slow) frame finished."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        st = _is_frozen(sem)
-        if st is None:
-            return  # cannot read; rely on the time padding
-        if st:
-            return
-        time.sleep(poll_s)
-    if log:
-        log(f"[refine] WARNING: DP_FROZEN did not report Frozen within {timeout_s:.0f}s; "
-            f"the grabbed frame may be incomplete.")
-
-
 class ScopeRefineAdapter(RefineScope):
-    """Real adapter over smartsem_com.SmartSEM. Instrument-untested.
+    """Real adapter over smartsem_com.SmartSEM.
 
-    Uses the frame-safe grab sequence proven in the autofocus fork (unfreeze ->
-    scan a full frame -> freeze at end of frame -> grab from the frozen buffer).
+    v0.54.0: every frame is frame_grab's single-frame protocol (unfreeze -> immediate
+    end-of-frame freeze -> wait Frozen -> Grab; one pass at the scan speed), and a frame
+    that fails its checks raises StaleFrameError -- refine never corrects from it. The
+    scan speed is set ONCE for the refine sequence (the first frame that needs it) and
+    put back by restore_scan_rate(); the magnification is read again after every frame.
     Stage motion is X/Y only and is only ever called when refine.py is explicitly
     allowed to use the stage (disabled by default).
     """
@@ -389,7 +355,7 @@ class ScopeRefineAdapter(RefineScope):
     def __init__(self, sem, *, settle_s: float = 1.0, frame_wait_s: float = 3.0,
                  grab_size: Tuple[int, int] = (1024, 768), grab_reduction: int = 0,
                  imaging_scan_rate: Optional[int] = None, scan_rate_method: str = "cmd",
-                 freeze_on_end_frame: bool = True, frozen_timeout_s: float = 30.0,
+                 freeze_on_end_frame: bool = True, frozen_timeout_s: float = 60.0,
                  stage_arrival_tol_m: float = 1.0e-6, stage_arrival_timeout_s: float = 60.0,
                  dry_run: bool = False, logger=None) -> None:
         self._sem = sem
@@ -405,10 +371,37 @@ class ScopeRefineAdapter(RefineScope):
         self.grab_reduction = int(grab_reduction)
         self.imaging_scan_rate = imaging_scan_rate
         self.scan_rate_method = scan_rate_method
+        # v0.54.0: kept for callers; the single-frame protocol always uses End Frame.
         self.freeze_on_end_frame = bool(freeze_on_end_frame)
+        # v0.54.0: frame_wait_s is used only when DP_FROZEN is unreadable;
+        # frozen_timeout_s only when AP_FRAME_TIME is unreadable (else 2 frame times).
         self.frozen_timeout_s = float(frozen_timeout_s)
         self.dry_run = bool(dry_run)
         self._log = logger or (lambda m: None)
+        # v0.54.0: speed set once per sequence
+        self._rate_orig: Optional[int] = None
+        self._rate_saved = False
+        self._rate_applied: Optional[int] = None
+
+    def _use_scan_rate(self, rate: Optional[int]) -> None:
+        """Set the scan speed only when it differs from the one this sequence already
+        set; the first change remembers the original for restore_scan_rate()."""
+        if rate is None or (self._rate_applied is not None and int(rate) == self._rate_applied):
+            return
+        orig = _apply_scan_rate(self._sem, int(rate), self.scan_rate_method, self._log)
+        if not self._rate_saved:
+            self._rate_orig, self._rate_saved = orig, True
+        self._rate_applied = int(rate)
+        time.sleep(SCAN_RATE_SETTLE_S)     # let AP_FRAME_TIME follow the new speed
+
+    def restore_scan_rate(self) -> None:
+        """Put back the scan speed the sequence started with (if it was changed)."""
+        if self.dry_run or not self._rate_saved:
+            return
+        orig, applied = self._rate_orig, self._rate_applied
+        self._rate_orig, self._rate_saved, self._rate_applied = None, False, None
+        if orig is not None and orig != applied:
+            _apply_scan_rate(self._sem, int(orig), self.scan_rate_method, self._log)
 
     def _assert_magnification(self, magnification: float) -> None:
         """Set AP_FIB_MAGNIFICATION and VERIFY it took (read back, retry once).
@@ -443,7 +436,7 @@ class ScopeRefineAdapter(RefineScope):
     def ensure_magnification(self, magnification: float) -> None:
         if self.dry_run:
             return
-        _ensure_fib_imaging(self._sem)
+        _ensure_fib_imaging(self._sem, log=self._log)
         self._assert_magnification(magnification)
 
     def grab_fib_image(self, magnification: float, scan_rate=None) -> np.ndarray:
@@ -455,60 +448,37 @@ class ScopeRefineAdapter(RefineScope):
             raise RuntimeError("Pillow is required to read grabbed BMP images.")
 
         # ORDER MATTERS: FIB imaging mode FIRST (SmartFIB keeps separate imaging/
-        # milling mags), THEN set + verify the mag, THEN grab.
-        _ensure_fib_imaging(self._sem)
+        # milling mags; the switch resets the mag, sometimes late -- bug #14), THEN set
+        # + verify the mag, THEN the speed (once per sequence), THEN the frame.
+        from ..frame_grab import (StaleFrameError, fib_mag_still, grab_fresh_frame,
+                                  is_stale_warning)
+        _ensure_fib_imaging(self._sem, log=self._log)
         self._assert_magnification(magnification)
+        self._use_scan_rate(self.imaging_scan_rate if scan_rate is None else scan_rate)
 
-        # Raise the imaging dwell (scan rate) for this correlation frame to lift SNR,
-        # remembering the original to restore afterwards.
-        orig_rate = None
-        rate = self.imaging_scan_rate if scan_rate is None else scan_rate
-        if rate is not None:
-            orig_rate = _apply_scan_rate(self._sem, int(rate),
-                                         self.scan_rate_method, self._log)
-        # Freeze at the END of a frame so a slower (higher-dwell) frame is captured
-        # complete, not half-scanned.
-        if self.freeze_on_end_frame:
-            try:
-                self._sem.set_value("DP_FREEZE_ON", "End Frame")
-            except Exception:
-                try:
-                    self._sem.set_value("DP_FREEZE_ON", 0.0)
-                except Exception:
-                    pass
+        fd, path = tempfile.mkstemp(suffix=".bmp", prefix="pyfib_refine_")
+        os.close(fd)
         try:
-            try:
-                self._sem.execute("CMD_UNFREEZE_ZONE")
-            except Exception:
-                pass
-            time.sleep(self.frame_wait_s)          # minimum; poll below guarantees completion
-            try:
-                self._sem.execute("CMD_FREEZE_ZONE")
-            except Exception:
-                try:
-                    self._sem.execute("CMD_FREEZE_ALL")
-                except Exception:
-                    pass
-            _wait_frozen(self._sem, self.frozen_timeout_s, log=self._log)
-
-            fd, path = tempfile.mkstemp(suffix=".bmp", prefix="pyfib_refine_")
-            os.close(fd)
-            try:
-                w, h = self.grab_size
-                self._sem.grab_bmp(path, xoff=0, yoff=0, width=w, height=h,
-                                   reduction=self.grab_reduction)
-                with Image.open(path) as im:
-                    return np.asarray(im.convert("L"), dtype=np.float64)
-            finally:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            w, h = self.grab_size
+            warn = grab_fresh_frame(self._sem, path, width=w, height=h,
+                                    reduction=self.grab_reduction,
+                                    frame_wait_s=self.frame_wait_s,
+                                    frozen_timeout_s=self.frozen_timeout_s, log=self._log)
+            if is_stale_warning(warn):
+                raise StaleFrameError(f"refine frame not usable: {warn} Not correcting.")
+            ok, post = fib_mag_still(self._sem, float(magnification))
+            if not ok and post is not None:      # unreadable: as _assert_magnification
+                raise RuntimeError(
+                    f"the FIB magnification read {post}x after the frame, not "
+                    f"{float(magnification):g}x (the column changed during the frame); "
+                    f"not correcting from it.")
+            with Image.open(path) as im:
+                return np.asarray(im.convert("L"), dtype=np.float64)
         finally:
-            # Always restore the original scan rate, even if the grab threw.
-            if orig_rate is not None:
-                _apply_scan_rate(self._sem, orig_rate, self.scan_rate_method,
-                                 self._log)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def get_beam_shift(self) -> Tuple[float, float]:
         return (float(self._sem.get_float("AP_FIB_BEAM_SHIFT_X")),

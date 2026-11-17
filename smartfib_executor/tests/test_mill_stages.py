@@ -67,6 +67,13 @@ class _Sem:
         return 0.0
 
     def get_str(self, m):
+        # v0.53.5: the milling flags as the instrument reports them (Evan, 2026-10-13)
+        if m == "DP_FIB_MODE":
+            return "Milling" if self.milling else "Imaging"
+        if m == "DP_FIB_IMAGING":
+            return "Mill + SEM" if self.milling else "SEM"
+        if m == "DP_PATTERNING_MODE":
+            return "FIB + SEM" if self.milling else "Off"
         return "Imaging"
 
     def set_value(self, m, v):
@@ -268,13 +275,23 @@ def test_push_loads_and_prepares_but_never_starts():
 
 # --------------------------------------------------------------------------- manual
 def test_manual_goto_align_push_record_and_the_manual_run_log():
+    # v0.53.5: put the not-milling windows back afterwards (other tests check them)
+    from .. import site_ops as SO
+    saved = (SO.GUARD_S, SO.GUARD_MOTION_S, SO.MANUAL_GUARD_S)
+    try:
+        _manual_goto_align_push_record_and_the_manual_run_log()
+    finally:
+        SO.GUARD_S, SO.GUARD_MOTION_S, SO.MANUAL_GUARD_S = saved
+
+
+def _manual_goto_align_push_record_and_the_manual_run_log():
     from .. import site_ops as SO
     from ..milling_workflow import RefineConfig
     d, pf = _session()
     db = PositionDatabase.load(pf)
     rec = db.get("position_1")
     logs = []
-    SO.GUARD_S = SO.GUARD_MOTION_S = 0.0        # the window itself: test_not_milling_window
+    SO.GUARD_S = SO.GUARD_MOTION_S = SO.MANUAL_GUARD_S = 0.0   # the window itself: test_not_milling_window
     # every action refuses while SmartSEM indicates milling -- and changes nothing
     busy = _Sem(milling=True)
     for fn in (lambda: SO.site_goto(busy, rec, log=logs.append),
@@ -489,16 +506,16 @@ def test_not_milling_window_one_reading_is_not_enough():
     sem, t = _Sem(), [0.0]
     reads = iter([False, False, True])
     import smartfib_executor.batch as batch
-    old = batch._is_milling_active
-    batch._is_milling_active = lambda s: next(reads)
+    old = batch.milling_state
+    batch.milling_state = lambda s, **k: (next(reads), "DP_FIB_MODE = 2 'Milling'")
     try:
         SO._milling_guard(sem, "Go to x", 10.0, log=lambda m: None, clock=lambda: t[0],
                           sleep=lambda dt: t.__setitem__(0, t[0] + dt))
         raise AssertionError("not refused")
-    except SO.SiteRefused:
-        pass
+    except SO.SiteRefused as e:
+        assert "(DP_FIB_MODE = 2 'Milling')" in str(e)       # v0.53.5: names the flag
     finally:
-        batch._is_milling_active = old
+        batch.milling_state = old
     assert sem.calls == [] and t[0] == 1.0                                  # 3rd poll at 1 s
     t[0] = 0.0
     SO._milling_guard(sem, "Push", 5.0, log=lambda m: None, clock=lambda: t[0],
@@ -540,7 +557,7 @@ def test_review_guards_load_method_recapture_old_files_and_suspect_frames():
     from .test_after_image import ScopeSem, _Rec
     import smartfib_executor.frame_grab as FG
     oldw = FG.wait_frozen
-    FG.wait_frozen = lambda sem, t: False
+    FG.wait_frozen = lambda sem, t, *a, **k: False
     try:
         path, warn = grab_after_mill_image(ScopeSem(), _Rec(), d / "images",
                                            milling_active=lambda: False, frame_wait_s=0.0,

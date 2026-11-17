@@ -10,6 +10,7 @@ TILT_LIMIT_TEST.txt     mill batches: 2 deg tilt limit, read-only check, skip OK
 SEM_FOCUS_CURVE_TEST.txt  SEM focus curves at low mag / 2000x and several scan speeds
 SEM_AUTOFOCUS_TWO_STAGE_TEST.txt  two-stage SEM autofocus: speed, accuracy, far starts
 MILL_STAGES_TEST.txt    Rough Mill / Prepolish / Polish: stage patterns, after images, manual buttons, push without milling
+CLEM_OVERVIEW_TEST.txt  Correlation tab: go to grid, FIB/SEM overviews at SEM normal, 400x stage scale at +30
 api_check.py            read-only API check:  python test_scripts\api_check.py
 
 T06  refine stage correction  -- run in this order, stop if any step says FAIL:

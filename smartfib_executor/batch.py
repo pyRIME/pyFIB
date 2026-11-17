@@ -3,11 +3,12 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import Iterable, List, Literal, Optional
+from typing import Iterable, List, Literal, Optional, Tuple
 
 from .positions import PositionDatabase, PositionRecord, recall_position
-from .runner import MILLING_IMAGING_CODES, PatternJob, PatternRunner
+from .runner import FIB_MODE_NAME_TO_CODE, MILLING_IMAGING_CODES, PatternJob, PatternRunner
 from .smartsem_com import SmartSEM, SmartSEMError
+from .safe_output import output_lost as _output_lost, lost_reason as _lost_reason, say as _say
 from .tilt_guard import BATCH_TILT_LIMIT_DEG, TiltLimitError, plan_batch_tilts, read_live_tilt
 from .milling_workflow import (
     AutofocusConfig, RefineConfig,
@@ -185,46 +186,89 @@ def _zero_fib_beam_shift(sem: SmartSEM, *, logger=print, verify: bool = True,
     return ok
 
 
+def _norm_state(text: str) -> str:
+    return text.upper().replace(" ", "").replace("_", "").replace("-", "")
+
+
+MILLING_MODE_CODES = (2, 5)          # DP_FIB_MODE: Milling, To Milling
+_MODE_CODES = {_norm_state(k): v for k, v in FIB_MODE_NAME_TO_CODE.items()}
+# v0.53.5 (bug #15): DP_PATTERNING_MODE codes MEASURED on this Crossbeam 550 (Evan,
+# 2026-10-13, debug-fib-imaging; number and text agreed in every state):
+#   0 'Off'        after a pattern finishes
+#   2 'FIB'        after a SmartFIB snapshot -- the beam is imaging, NOT milling
+#   3 'FIB + SEM'  while milling
+# pyFIB's own runner WRITES DP_PATTERNING_MODE = 'FIB' right after CMD_FIB_START_MILLING
+# (copied from SerialFIB), so during a pyFIB-started mill 'FIB' may well mean milling.
+# Hence two rule sets (review 2026-10-14):
+#   strict  (default; batch interlock, after images): only Off (0) is not milling;
+#   snapshot_ok (the operator's manual buttons / CLEM actions): FIB (2) is not milling
+#            either -- the operator starts their own mills in SmartFIB (3 'FIB + SEM').
+PATTERNING_CODES = {"OFF": 0, "FIB": 2, "FIB+SEM": 3}
+PATTERNING_NOT_MILLING_STRICT = (0,)
+PATTERNING_NOT_MILLING_SNAPSHOT_OK = (0, 2)
+
+
+def _desc(text: Optional[str], num: Optional[int]) -> str:
+    if text is not None and num is not None:
+        return f"{num} '{text}'"
+    if text is not None:
+        return f"'{text}'"
+    return str(num) if num is not None else "unreadable"
+
+
+def milling_state(sem: SmartSEM, *, snapshot_ok: bool = False) -> Tuple[bool, str]:
+    """Conservative check of whether SmartSEM is milling. Returns (active, reason).
+
+    Each flag is read as text AND as a number; if EITHER says milling, it is milling
+    (the instrument's numbers and text have agreed so far, but the runner's notes say a
+    number can disagree, so neither is trusted alone). Milling when:
+      - DP_FIB_MODE is Milling (2) or To Milling (5);
+      - DP_FIB_IMAGING's text contains 'MILL', or its number is 2 or 4;
+      - DP_PATTERNING_MODE is anything but Off (0). With ``snapshot_ok`` (the manual
+        buttons only), FIB (2) is not milling either: it is what a SmartFIB snapshot
+        leaves (bug #15). A text label not in the measured map says nothing; the number
+        decides;
+      - DP_FIB_MODE's NUMBER can't be read (as in v0.53.4), or DP_FIB_IMAGING /
+        DP_PATTERNING_MODE can't be read at all (neither text nor number).
+    ``reason`` names the flag that decided it, with what it read."""
+    # -- FIB mode
+    mode_t, mode_n = _safe_get_str(sem, 'DP_FIB_MODE'), _safe_get_float_int(sem, 'DP_FIB_MODE')
+    mode_tc = _MODE_CODES.get(_norm_state(mode_t)) if mode_t is not None else None
+    if mode_tc in MILLING_MODE_CODES or mode_n in MILLING_MODE_CODES:
+        return True, f"DP_FIB_MODE = {_desc(mode_t, mode_n)}"
+    # -- imaging
+    img_t, img_n = _safe_get_str(sem, 'DP_FIB_IMAGING'), _safe_get_float_int(sem, 'DP_FIB_IMAGING')
+    if (img_t is not None and 'MILL' in img_t.upper()) or img_n in MILLING_IMAGING_CODES:
+        return True, f"DP_FIB_IMAGING = {_desc(img_t, img_n)}"
+    # -- patterning mode (a label the text map doesn't know leaves it to the number)
+    pat_t, pat_n = _safe_get_str(sem, 'DP_PATTERNING_MODE'), _safe_get_float_int(sem, 'DP_PATTERNING_MODE')
+    ok_codes = PATTERNING_NOT_MILLING_SNAPSHOT_OK if snapshot_ok else PATTERNING_NOT_MILLING_STRICT
+    pat_tc = None
+    if pat_t is not None:
+        pat_tc = (int(pat_t.strip()) if re.fullmatch(r"[0-9]+", pat_t.strip())
+                  else PATTERNING_CODES.get(_norm_state(pat_t)))
+    for code in (pat_tc, pat_n):
+        if code is not None and code not in ok_codes:
+            note = ("" if code in PATTERNING_CODES.values() else
+                    " (a value never seen before: treated as milling)")
+            return True, f"DP_PATTERNING_MODE = {_desc(pat_t, pat_n)}{note}"
+    # -- unreadable = cannot tell = milling (never move the stage on a guess)
+    if mode_n is None:          # the number is required, as before v0.53.5 (review)
+        return True, f"DP_FIB_MODE unreadable as a number (text {mode_t!r})"
+    if img_t is None and img_n is None:
+        return True, "DP_FIB_IMAGING unreadable"
+    if pat_tc is None and pat_n is None:
+        return True, ("DP_PATTERNING_MODE unreadable" if pat_t is None else
+                      f"DP_PATTERNING_MODE unreadable as a number and text {pat_t!r} is not a "
+                      f"known value")
+    return False, (f"not milling (DP_FIB_MODE = {_desc(mode_t, mode_n)}, DP_FIB_IMAGING = "
+                   f"{_desc(img_t, img_n)}, DP_PATTERNING_MODE = {_desc(pat_t, pat_n)})")
+
+
 def _is_milling_active(sem: SmartSEM) -> bool:
-    """Conservative safety check for whether SmartSEM still indicates active milling.
-
-    We use multiple DP_ signals and deliberately treat *unknown/unreadable* states
-    as "active" to avoid moving the stage mid-pattern.
-
-    Returns True when *any* of the following indicates activity:
-      - DP_FIB_MODE in (2=Milling, 5=To Milling)
-      - DP_FIB_IMAGING indicates Milling / Mill+SEM (string contains 'MILL' or code in MILLING_IMAGING_CODES)
-      - DP_PATTERNING_MODE is not Off (0) (if available)
-
-    Returns False only when we can read enough signals to be confident milling is not active.
-    """
-
-    mode = _safe_get_float_int(sem, 'DP_FIB_MODE')
-    img_str = _safe_get_str(sem, 'DP_FIB_IMAGING')
-    img_code = _safe_get_float_int(sem, 'DP_FIB_IMAGING')
-    pat_code = _safe_get_float_int(sem, 'DP_PATTERNING_MODE')
-
-    # Positive evidence of activity
-    if mode in (2, 5):
-        return True
-
-    if img_str is not None and 'MILL' in img_str.upper():
-        return True
-
-    if img_code in MILLING_IMAGING_CODES:
-        return True
-
-    if pat_code is not None and pat_code != 0:
-        return True
-
-    # Conservative: if we cannot read key states reliably, do not move.
-    if mode is None:
-        return True
-
-    if img_str is None and img_code is None:
-        return True
-
-    return False
+    """True while SmartSEM indicates milling (or the state cannot be read). See
+    milling_state for the rules; used to never move the stage mid-pattern."""
+    return milling_state(sem)[0]
 
 
 def _wait_not_milling_stable(
@@ -258,6 +302,61 @@ def _wait_not_milling_stable(
         time.sleep(float(poll_s))
 
 
+class BatchStopped(RuntimeError):
+    """v0.55.1: the batch stopped itself at a safe point (before a stage move), e.g.
+    because the pyFIB window that started it is gone. Not an instrument error."""
+
+
+# Waiting modes in which the runner returns only after SmartSEM confirmed the mill ended.
+CONFIRMED_WAIT_STRATEGIES = ("mode_change", "blanked", "auto")
+SNAPSHOT_HINT = (" If nothing is milling: a SmartFIB snapshot leaves DP_PATTERNING_MODE at "
+                 "'FIB'; switching the SEM on and off clears it.")
+
+
+def _reset_beam_shift_when_idle(sem: SmartSEM, *, logger=print, where: str = "",
+                                quiet_s: float = 0.0, poll_s: float = 0.5,
+                                _sleep=time.sleep, _clock=time.time) -> Optional[bool]:
+    """Zero the FIB beam shift ONLY while SmartSEM does not indicate milling (v0.55.1,
+    bug #16). Never raises.
+
+    A beam-shift write in the middle of a pattern moves where the rest of it lands, so
+    nothing is written when milling is indicated or the state cannot be read (the strict
+    batch rule of milling_state). ``quiet_s`` > 0: the state must read "not milling" on
+    every poll for that long first (used when the site ended WITHOUT a confirmed end of
+    milling: a single reading can fall in the gap between two parts of a pattern); one
+    milling reading ends the wait at once.
+
+    Returns True (zeroed and confirmed), False (written, not confirmed) or None (NOT
+    written: milling indicated; the caller resets before the next stage move).
+    (A second Ctrl+C during the quiet window still ends the process; nothing is written.)"""
+    log = logger or (lambda m: None)
+
+    def _l(msg):
+        try:
+            log(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        t0 = _clock()
+        if quiet_s and float(quiet_s) > 0:
+            _l(f"[beam-shift] checking for {float(quiet_s):.0f} s that milling has stopped "
+               f"before the FIB beam shift is reset {where}...")
+        while True:
+            active, why = milling_state(sem)
+            if active:
+                _l(f"[beam-shift] *** NOT reset {where}: SmartSEM indicates milling ({why}). "
+                   f"The FIB beam shift is left as it is, so a running pattern is not moved. "
+                   f"pyFIB resets it before its next stage move; Go to resets it too. ***")
+                return None
+            if not quiet_s or (_clock() - t0) >= float(quiet_s):
+                break
+            _sleep(float(poll_s))
+    except Exception as e:  # noqa: BLE001   cannot tell = do not write
+        _l(f"[beam-shift] *** NOT reset {where}: the milling state could not be checked "
+           f"({e}). ***")
+        return None
+    return _zero_fib_beam_shift(sem, logger=_l)
 
 
 def mill_positions_sequential(
@@ -433,12 +532,36 @@ def mill_positions_sequential(
 
     # Start from a known-zero FIB beam shift so the FIRST site's refine is not
     # baselined on a leftover shift (which may already be high before we begin).
+    # v0.55.1 (#16): never while SmartSEM indicates milling. A mill that is still running
+    # when the batch starts is waited for first (the same interlock as before a stage
+    # move), so its pattern is not moved by the reset.
+    beam_reset_pending = False       # a reset that was skipped because milling was indicated
     if reset_beam_shift_between_positions and not dry_run_focus_refine:
+        _active, _why = milling_state(sem)
+        if _active:
+            print(f"[safety] SmartSEM indicates milling activity ({_why}) at batch start; "
+                  f"waiting for it to become inactive before the FIB beam shift is reset..."
+                  + (SNAPSHOT_HINT if "DP_PATTERNING_MODE" in _why else ""))
+            _wait_not_milling_stable(
+                sem, stable_s=10.0,
+                timeout_s=float(wait_timeout_s) if float(wait_timeout_s) > 0 else 0.0,
+                poll_s=0.5)
         print("[beam-shift] zeroing FIB beam shift X/Y before the first site.")
-        _zero_fib_beam_shift(sem, logger=print)
+        if _reset_beam_shift_when_idle(sem, logger=print, where="before the first site") is None:
+            beam_reset_pending = True
 
     for idx, name in enumerate(names, start=1):
+        # v0.55.1 (#16): the pyFIB window that started this batch is gone (its output pipe
+        # closed). The site in progress was finished normally; stop here, before the next
+        # stage move, instead of running on with nobody able to see it.
+        if _output_lost():
+            raise BatchStopped(
+                f"the pyFIB window that started this batch is gone ({_lost_reason()}); "
+                f"stopped before {name}: {idx - 1} of {total} position(s) were handled, "
+                f"nothing was moved for the rest")
         rec: PositionRecord = db.get(name)
+        runner_entered = False       # CMD_FIB_START_MILLING may have been sent at this site
+        mill_confirmed_done = False  # ... and SmartSEM confirmed that the mill ended
         print("\n" + "=" * 72)
         print(f"[{idx}/{total}] Milling at {rec.name}")
         print(
@@ -456,9 +579,11 @@ def mill_positions_sequential(
             # otherwise trigger a stage move mid-pattern (high risk for sample motion / damage).
             # If SmartSEM still indicates milling, wait here rather than moving the stage.
             # This prevents mid-pattern stage motion if the milling-complete detection was wrong.
-            if _is_milling_active(sem):
+            _active, _why = milling_state(sem)
+            if _active:
                 print(
-                    "[safety] SmartSEM still indicates milling activity; waiting for it to become inactive before stage move..."
+                    f"[safety] SmartSEM still indicates milling activity ({_why}); waiting "
+                    f"for it to become inactive before stage move..."
                 )
                 _wait_not_milling_stable(
                     sem,
@@ -466,6 +591,22 @@ def mill_positions_sequential(
                     timeout_s=float(wait_timeout_s) if float(wait_timeout_s) > 0 else 0.0,
                     poll_s=0.5,
                 )
+
+            # v0.55.1 (#16): a beam-shift reset that was skipped while milling was
+            # indicated is done now, before anything moves. If milling is indicated
+            # again, this site is not started.
+            if (beam_reset_pending and reset_beam_shift_between_positions
+                    and not dry_run_focus_refine):
+                print(f"[beam-shift] resetting the FIB beam shift left from the previous "
+                      f"site before {rec.name}.")
+                if _reset_beam_shift_when_idle(sem, logger=print,
+                                               where=f"before {rec.name}",
+                                               quiet_s=float(done_confirm_s)) is None:
+                    raise SmartSEMError(
+                        f"the FIB beam shift could not be reset before {rec.name}: SmartSEM "
+                        f"indicates milling again; not moving")
+                beam_reset_pending = False
+                _log("run_note", "beam_shift_not_reset", None)
 
             # 1) Move stage first (if requested)
             if tilt_plan is not None and rec.stage_at.t_deg is not None:
@@ -557,7 +698,22 @@ def mill_positions_sequential(
             if _src == "authored":
                 _report_ely_pattern(idx, total, rec, ref_base_dir)
 
+            # v0.53.1: the objective in effect now (recorded value or autofocus result)
+            # is restored for the after image -- SmartFIB may change it while milling.
+            pre_mill_obj = _safe_get_float(sem, "AP_FIB_OBJECTIVE_POTENTIAL")
+            if pre_mill_obj is None and not skip_objective:
+                pre_mill_obj = float(rec.fib_objective_potential_v)
+            # v0.55.1 (review): the window went away BEFORE this site's mill was started
+            # (during recall, autofocus or refine). Do not start a mill nobody can see;
+            # the clean-up below resets the beam shift (nothing is milling).
+            if _output_lost():
+                raise BatchStopped(
+                    f"the pyFIB window that started this batch is gone ({_lost_reason()}); "
+                    f"stopped at {rec.name} before its mill was started: "
+                    f"{idx - 1} of {total} position(s) were milled")
+            runner_entered = True
             runner.run(job)
+            mill_confirmed_done = str(wait_strategy) in CONFIRMED_WAIT_STRATEGIES
             print(f"[{idx}/{total}] Completed milling at {rec.name}")
 
             # 3b) After-mill image (optional, v0.41.0). Taken BEFORE the beam-shift reset
@@ -570,7 +726,7 @@ def mill_positions_sequential(
                                (Path(ref_base_dir) / "images" if ref_base_dir else Path("images")))
                     a_path, a_warn = grab_after_mill_image(
                         sem, rec, img_dir, milling_active=lambda: _is_milling_active(sem),
-                        log=print, stage=stage)
+                        log=print, stage=stage, objective_v=pre_mill_obj)
                 except Exception as e:  # noqa: BLE001
                     a_path, a_warn = None, f"after-mill image for {rec.name} FAILED ({e})"
                 if a_path is not None:
@@ -610,19 +766,67 @@ def mill_positions_sequential(
             _log("site_end", "stopped", "interrupted (Ctrl+C)")
             raise
 
+        except BatchStopped as e:
+            # never swallowed by --continue-on-error: the batch ends here
+            _say(f"Stopped at {rec.name}: {e}")
+            _log("site_end", "stopped", str(e))
+            raise
+
         except Exception as e:
-            print(f"Error at {rec.name}: {e}")
+            # _say: these lines must never raise themselves (v0.55.1) -- an error while
+            # reporting an error skipped the run-log entry and went straight to clean-up.
+            _say(f"Error at {rec.name}: {e}")
+            if runner_entered and not mill_confirmed_done:
+                _say(f"[{idx}/{total}] *** The pattern at {rec.name} may still be running in "
+                     f"SmartFIB: pyFIB has NOT stopped it and does not touch the FIB beam "
+                     f"shift while SmartSEM indicates milling. Check SmartFIB. ***")
             _log("site_end", "error", f"{type(e).__name__}: {e}")
             if not continue_on_error:
                 raise
-            print("Continuing to next position due to --continue-on-error...")
+            _say("Continuing to next position due to --continue-on-error...")
 
         finally:
             # Return FIB beam shift to zero after milling completes (or after an
             # error) so any refine correction applied for THIS site does not carry
             # into the next one. Runs on success, handled/again-raised errors, and
             # Ctrl+C, leaving the column ready for the next site.
+            # v0.55.1 (#16): ONLY while SmartSEM does not indicate milling. When the site
+            # ended without a confirmed end of milling (an error or Ctrl+C after the mill
+            # was started, or a wait mode that does not confirm), "not milling" must hold
+            # for the confirm-done window first. Otherwise the reset is left for the next
+            # site's start (after its interlock) or for Go to.
             if reset_beam_shift_between_positions and not dry_run_focus_refine:
-                if _zero_fib_beam_shift(sem, logger=print):
-                    print(f"[{idx}/{total}] FIB beam shift X/Y reset to 0 "
-                          f"after {rec.name}.")
+                _quiet = (float(done_confirm_s)
+                          if (runner_entered and not mill_confirmed_done) else 0.0)
+                _res = _reset_beam_shift_when_idle(
+                    sem, logger=_say, where=f"after {rec.name}", quiet_s=_quiet)
+                if _res is None:
+                    beam_reset_pending = True
+                    # noted at once (review): the batch may end by an error or a stop
+                    # before the end-of-batch block below is reached
+                    _log("run_note", "beam_shift_not_reset",
+                         f"the FIB beam shift was NOT reset after {rec.name} (SmartSEM "
+                         f"indicated milling); Go to resets it")
+                else:
+                    beam_reset_pending = False
+                    _log("run_note", "beam_shift_not_reset", None)
+                    if _res:
+                        _say(f"[{idx}/{total}] FIB beam shift X/Y reset to 0 "
+                             f"after {rec.name}.")
+
+    # v0.55.1 (review): the batch must not end quietly with a refine correction still on
+    # the column. One more guarded try (milling may just have ended); otherwise say so
+    # loudly and note it in the run log. Still never written while milling is indicated.
+    if beam_reset_pending and reset_beam_shift_between_positions and not dry_run_focus_refine:
+        _res = _reset_beam_shift_when_idle(sem, logger=_say, where="at the end of the batch",
+                                           quiet_s=float(done_confirm_s))
+        if _res is None:
+            msg = ("the FIB beam shift was NOT reset at the end of the batch (SmartSEM "
+                   "indicates milling). It still holds the last site's correction: press "
+                   "Go to before the next capture or mill (it resets it).")
+            _say(f"*** WARNING: {msg} ***")
+            _log("run_note", "beam_shift_not_reset", msg)
+        else:
+            _log("run_note", "beam_shift_not_reset", None)
+            if _res:
+                _say("[beam-shift] FIB beam shift X/Y reset to 0 at the end of the batch.")

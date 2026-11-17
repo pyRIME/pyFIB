@@ -89,6 +89,12 @@ def refine_summary(res) -> Optional[Dict[str, Any]]:
         "stage_refused": bool(getattr(res, "stage_refused", False)),
         "stage_required_but_disabled": bool(getattr(res, "stage_required_but_disabled", False)),
         "frames": getattr(res, "frames", None),
+        # v0.54.0: scan speed of the 2000x pass, whether the speed fallback ran, and how
+        # long the whole refine took (annotation only).
+        "scan_rate": getattr(res, "scan_rate", None),
+        "speed_fallback_used": bool(getattr(res, "speed_fallback_used", False)),
+        "speed_fallback_scan_rate": getattr(res, "speed_fallback_scan_rate", None),
+        "duration_s": _fnum(getattr(res, "duration_s", None), 1),
         "message": str(getattr(res, "message", "") or ""),
     }
 
@@ -222,9 +228,10 @@ class RunLog:
         if self.path is None:
             return
         try:
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(self.data, indent=1), encoding="utf-8")
-            os.replace(str(tmp), str(self.path))
+            # v0.55.1 (#19): unique temp name + retry while Windows has the file locked
+            # (the report or a virus scanner reading it).
+            from ..atomic_io import write_text_atomic
+            write_text_atomic(self.path, json.dumps(self.data, indent=1))
         except Exception as e:  # noqa: BLE001
             self._warn(f"could not write {self.path}: {e}")
 
@@ -350,6 +357,16 @@ class RunLog:
                                       for n, r in skipped.items()]
 
     # ------------------------------------------------------------------ run
+    @_guard
+    def run_note(self, key: str, text: Optional[str]) -> None:
+        """A note about the whole run (v0.55.1), e.g. a beam shift left un-reset."""
+        notes = self.data.setdefault("notes", {})
+        if text is None:
+            notes.pop(str(key), None)            # the condition no longer holds
+        else:
+            notes[str(key)] = str(text)
+        self._save()
+
     @_guard
     def finish(self, status: str, message: Optional[str] = None) -> None:
         """Close the run: "completed" | "stopped" | "error". Also ends the console copy."""

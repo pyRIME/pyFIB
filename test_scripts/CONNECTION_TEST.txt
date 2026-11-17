@@ -1,0 +1,43 @@
+ONE SMARTSEM CONNECTION AT A TIME (pyFIB v0.53.3)                          about 10 min
+==============================================================================
+Why: in v0.53.2 an armed Rough Mill Start connected to SmartSEM twice in a row (tilt
+check, then the batch); the second connection crashed in the ZEISS API ("Failed to create
+an instance of Managed ...", exit -1073741819). Now Start connects once.
+
+1) BEFORE STARTING                                                         1 min
+   Close pyFIB. Command prompt in the pyFIB folder:
+       python test_scripts\api_check.py
+   Expect: python.exe processes: 1, pythonw.exe processes: 0, "connected: remoting" and
+   the stage. A line "^^^ holds a SmartSEM connection" names a process to end first.
+
+2) ROUGH MILL, ALL POSITIONS WITHIN 2 DEG OF THE CURRENT TILT              5 min
+   Start pyFIB, Rough Mill tab, the same two positions as before, ARM on, Start.
+   Expect in the Log ONE command line with --arm (no separate --tilt-check run), then
+   "TILT-CHECK: ... excluded=" and the batch. No ZEISS popup.
+
+3) OPTIONAL: A POSITION OUT OF RANGE                                       3 min
+   Tick one position recorded at a very different tilt. Start (armed) -> the batch stops
+   ("[tilt] Refusing ... Nothing moved", exit 3) -> the dialog lists it -> Yes -> the batch
+   starts again with --accept-tilt-skips. You may see "[connect] waiting for another
+   SmartSEM client to finish" for a few seconds; that is the first run letting go.
+
+4) TWO CLIENTS AT ONCE: GISDEP TAB FIRST (pyFIB v0.55.1, bug #18)           5 min
+   Why: once the GISDEP tab has been opened, the pyFIB window keeps its own SmartSEM
+   connection, and every command pyFIB starts adds a second one. Whether that is what
+   crashed Start on 2026-10-12 was never measured. This step is read-only.
+   a) Start pyFIB. Open the GISDEP tab and wait until it shows the live state (not MOCK).
+   b) Command prompt in the pyFIB folder (nothing moves, nothing is set):
+          python -m smartfib_executor.cli milling-check
+      Expect the three flags and both verdicts. No ZEISS popup, Python does not close.
+   c) In pyFIB, Tools tab, ARM OFF: press Run FIB autofocus (unarmed it connects, reads
+      and plans; it sets nothing).
+      Expect in the Log: "[connect] note: the pyFIB window (PID n) holds a SmartSEM
+      connection of its own (GISDEP tab); this command adds a second one."
+   d) While that command runs, look at the GISDEP tab: its panel is greyed out and the
+      live state stops updating; it comes back when the command has ended.
+   Send: the Log lines of c), and whether b) or c) gave a ZEISS popup or closed Python.
+   If both ran clean, two clients at once are fine on this instrument.
+
+If anything refuses with "another program holds a SmartSEM connection: python.exe PID ...",
+end that PID in Task Manager and try again; send the line. If Python still closes,
+send logs\pyfib_faults.log.

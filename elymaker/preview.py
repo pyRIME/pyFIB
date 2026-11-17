@@ -5,8 +5,10 @@ in the layout plane (micrometres), colour-keyed by mill depth, so you can eyebal
 a generated pattern before opening SmartFIB. It never touches the instrument.
 
 Screen convention: SmartFIB layout y increases upward; SVG y increases downward,
-so we flip y. Rectangles are drawn about their anchor with their (signed) height,
-matching how the box grows in the file.
+so we flip y. A rectangle's box runs from its anchor by the signed width and height,
+matching how the box grows in the file; a rotated rectangle turns counter-clockwise
+about the box centre, as SmartFIB places it (geometry.rect_corners; pyFIB patch
+0.9.1+pyfib.1 -- before it, rotation was drawn about the anchor).
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Tuple
 
+from .geometry import rect_center, rect_corners
 from .model import Arc, Layout, Polygon, Rect, Shape, Text
 
 
@@ -22,9 +25,10 @@ def _bounds(layout: Layout) -> Tuple[float, float, float, float]:
     ys: List[float] = []
     for _st, lref, sh in layout.iter_shapes():
         if isinstance(sh, Rect):
-            # (x,y) is the anchor corner; box extends by signed (width, height)
-            xs += [sh.x, sh.x + sh.width]
-            ys += [sh.y, sh.y + sh.height]
+            # the corners as SmartFIB places them (rotation about the box centre)
+            pts = rect_corners(sh.x, sh.y, sh.width, sh.height, sh.angle_deg)
+            xs += [p[0] for p in pts]
+            ys += [p[1] for p in pts]
         elif isinstance(sh, Polygon):
             xs += [p[0] for p in sh.points]
             ys += [p[1] for p in sh.points]
@@ -97,23 +101,15 @@ def to_svg(layout: Layout, width_px: int = 900, margin_px: int = 40) -> str:
 
         if isinstance(sh, Rect):
             # (x,y) is the anchor corner; the box extends by signed (width,
-            # height) and rotates about that corner. Draw corners relative to
-            # the anchor: (0,0) .. (w,h), then rotate and translate.
-            corners = [(0.0, 0.0), (sh.width, 0.0), (sh.width, sh.height), (0.0, sh.height)]
-            a = math.radians(sh.angle_deg)
-            ca, sa = math.cos(a), math.sin(a)
-            pts = []
-            for dx, dy in corners:
-                rx = dx * ca - dy * sa + sh.x
-                ry = dx * sa + dy * ca + sh.y
-                pts.append("%.2f,%.2f" % (sx(rx), sy(ry)))
+            # height) and SmartFIB rotates it counter-clockwise about its centre.
+            pts = ["%.2f,%.2f" % (sx(rx), sy(ry))
+                   for rx, ry in rect_corners(sh.x, sh.y, sh.width, sh.height,
+                                              sh.angle_deg)]
             parts.append('<polygon points="%s" fill="%s" fill-opacity="%s" stroke="%s"%s/>'
                          % (" ".join(pts), color, opacity, color, dash))
             if sh.imaging:
-                # imaging marker at the box centre
-                cdx, cdy = sh.width / 2.0, sh.height / 2.0
-                ccx = cdx * ca - cdy * sa + sh.x
-                ccy = cdx * sa + cdy * ca + sh.y
+                # imaging marker at the box centre (the pivot: unchanged by rotation)
+                ccx, ccy = rect_center(sh.x, sh.y, sh.width, sh.height)
                 parts.append('<circle cx="%.1f" cy="%.1f" r="3" fill="#ffd166"/>'
                              % (sx(ccx), sy(ccy)))
 

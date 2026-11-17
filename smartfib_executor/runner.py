@@ -264,9 +264,10 @@ class PatternRunner:
         This state is not always present on all installations, but when available it
         provides another useful signal for whether SmartFIB is actively patterning.
 
-        Observed values (Crossbeam / SmartFIB):
-          - 0: Off
-          - 3: FIB + SEM
+        Measured values (Crossbeam 550, Evan 2026-10-13; number and text agree):
+          - 0: Off        (after a pattern finishes)
+          - 2: FIB        (after a SmartFIB snapshot; not milling)
+          - 3: FIB + SEM  (while milling)
 
         Returns
         -------
@@ -288,13 +289,14 @@ class PatternRunner:
                     return int(s_norm)
                 if s_norm in ('OFF',):
                     return 0
-                # Heuristics for common labels
+                # v0.53.5: the measured codes (FIB was guessed as 1 and "SEM" as 2 before;
+                # only the log line changes -- every non-zero code still means "not done")
                 if 'FIB' in s_norm and 'SEM' in s_norm:
                     return 3
                 if 'FIB' in s_norm:
-                    return 1
-                if 'SEM' in s_norm:
                     return 2
+                if 'SEM' in s_norm:
+                    return -1          # not a known label: non-zero, so never "done"
         except Exception:
             pass
 
@@ -347,7 +349,10 @@ class PatternRunner:
         while True:
             # Abort confirmation if completion signature is no longer present.
             if not bool(is_done_fn()):
-                print("  [confirm] Completion not stable; continuing to wait.")
+                # v0.52.2: report how long the false "done" lasted -- the measurement for
+                # choosing the confirmation window (UI default 20 s, CLI 30 s).
+                print(f"  [confirm] Completion not stable after {time.time() - t_confirm:.1f} s "
+                      f"(window {confirm_s:.0f} s); continuing to wait.")
                 return False
 
             elapsed_confirm = time.time() - t_confirm

@@ -1,0 +1,11 @@
+pyMap v0.9.2, bundled unchanged into pyFIB v0.55.0 (2026-11-05) from pyMap_v0.9.2.zip
+(the Claude working on pyMap; its notes: claude/pyMap_response_to_pyFIB_review.md,
+revision 3). Earlier: v0.9.0 bundled in pyFIB v0.52.1 (2026-10-09); v0.9.1 was never
+bundled.
+Its tests are in ../pymap_tests (pyMap's tests/ folder, with its conftest.py that sends
+pyMap's diagnostics log to a temporary folder); its README is README_pyMap.md here; its
+requirements are ../requirements-pymap.txt (v0.9.2 needs nothing new).
+pyMap v0.9.2 writes <pyFIB>/logs/pymap.log (+ pymap_hangs.log, pymap_run_<pid>.json);
+PYMAP_DIAG=0 turns that off; pyFIB's GUI tests set PYMAP_LOG_DIR to a temporary folder.
+Run its tests from the pyFIB folder:  python -m pytest pymap_tests
+Replace this folder as a whole when pyMap is updated; do not edit it in pyFIB.

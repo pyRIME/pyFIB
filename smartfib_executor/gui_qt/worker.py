@@ -12,6 +12,7 @@ only when Qt is available.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,7 @@ if _HAVE_QT:
 
         line = Signal(str)               # one line of child stdout (newline stripped)
         finished_rc = Signal(int)        # process return code when it exits
+        started_pid = Signal(int)        # v0.55.0: the child's pid (for the run marker)
         failed = Signal(str)             # a launch/read error (not a child error)
 
         def __init__(self, argv: List[str], cwd: Optional[Path] = None,
@@ -60,17 +62,41 @@ if _HAVE_QT:
             self._stop = False
 
         def run(self) -> None:  # QThread entry point
+            # v0.55.0: the child writes UTF-8 (PYTHONIOENCODING) and the GUI decodes it
+            # with errors="replace". Before, both used the Windows code page: a byte that
+            # code page cannot decode raised in this loop, the GUI reported the command
+            # as finished (exit 1) while the child kept running unread -- and once the
+            # pipe filled, the child blocked mid-batch. A child printing a character
+            # outside the code page (a path, a unit) crashed on its own print.
             try:
                 self.line.emit("$ " + " ".join(self._argv))
+                # backslashreplace: even a lone surrogate cannot crash the child's print
+                env = dict(os.environ, PYTHONIOENCODING="utf-8:backslashreplace")
                 self._proc = subprocess.Popen(
                     self._argv,
                     cwd=str(self._cwd) if self._cwd else None,
                     stdin=(subprocess.PIPE if self._input_text is not None else None),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
+                    env=env,
                 )
+            except Exception as exc:  # noqa: BLE001   could not start the command
+                self.failed.emit(f"could not start the command: {exc}")
+                self.finished_rc.emit(1)
+                return
+            try:
+                self.started_pid.emit(int(self._proc.pid))
+            except Exception:  # noqa: BLE001
+                pass
+            if self._stop:                   # a stop requested before the child existed
+                try:
+                    self._proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
                 if self._input_text is not None and self._proc.stdin is not None:
                     try:
                         self._proc.stdin.write(self._input_text)
@@ -79,15 +105,27 @@ if _HAVE_QT:
                     except Exception:
                         pass
                 assert self._proc.stdout is not None
+                # Read to EOF even after a stop request: a child that is still alive
+                # must never block on a full pipe while wait() waits for it.
                 for raw in self._proc.stdout:
                     self.line.emit(raw.rstrip("\n"))
-                    if self._stop:
-                        break
-                rc = self._proc.wait()
-                self.finished_rc.emit(int(rc))
             except Exception as exc:  # noqa: BLE001
-                self.failed.emit(str(exc))
-                self.finished_rc.emit(1)
+                # Reading failed: say so, but keep the child's pipe drained and report
+                # its REAL exit code -- never "finished" while it is still running.
+                self.failed.emit(f"reading the command's output failed: {exc}; "
+                                 f"waiting for the command to end")
+                try:
+                    out = self._proc.stdout
+                    while out is not None and out.read(65536):
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                rc = self._proc.wait()
+            except Exception as exc:  # noqa: BLE001
+                self.failed.emit(f"could not read the command's exit code: {exc}")
+                rc = 1
+            self.finished_rc.emit(int(rc))
 
         def request_stop(self) -> None:
             """Ask the child to stop (best-effort terminate)."""

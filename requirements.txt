@@ -1,2 +1,10 @@
+# pyFIB core (instrument PC: Windows, Python 3.9.13).
+#   python -m pip install -r requirements.txt
+# v0.55.1: numpy, qtpy and PyQt5 are listed here too -- the pyFIB window and refine need
+# them, and before they were only in requirements-pymap.txt (which the guide calls
+# optional). Same pins as requirements-pymap.txt, so installing both stays consistent.
 pywin32>=306
 pillow>=10.0.0
+numpy==1.26.4
+qtpy>=2.4,<3
+PyQt5>=5.15,<5.16

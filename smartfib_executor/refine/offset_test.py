@@ -452,6 +452,10 @@ def main(argv=None) -> int:
         print(f"[offset-test] results + images saved to {out_dir.resolve()}")
         return 0 if res.ok else 1
     finally:
+        try:
+            scope.restore_scan_rate()      # v0.54.0: the speed is set once per sequence
+        except Exception:  # noqa: BLE001
+            pass
         if sem is not None:
             try:
                 sem.close()

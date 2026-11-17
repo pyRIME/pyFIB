@@ -146,46 +146,25 @@ class SimulatedImageSource(ImageSource):
 # --------------------------------------------------------------------------- #
 # Real instrument source (NOT yet validated on the microscope)
 # --------------------------------------------------------------------------- #
-def _ensure_fib_imaging(sem, timeout_s: float = 60.0, poll_s: float = 0.25) -> None:
-    """Put the column into FIB imaging, mirroring positions.py.
+def _ensure_fib_imaging(sem, timeout_s: float = 60.0, poll_s: float = 0.25,
+                        log=None) -> None:
+    """Put the column into FIB imaging.
 
-    NOTE: kept in sync deliberately with the capture flow in positions.py. At
-    reintegration these should be unified into one shared helper.
+    v0.54.0: the shared switch (frame_grab.ensure_fib_imaging, bug #14) -- the one the
+    capture, after image and refine use: switch only if not already in FIB imaging, then
+    let SmartSEM's magnification reset land before the magnification is set.
     """
-
-    def _img_state():
-        try:
-            return sem.get_str("DP_FIB_IMAGING").strip()
-        except Exception:
-            return None
-
-    cur = _img_state()
-    if cur is None or cur.upper() != "FIB":
-        sem.execute("CMD_FIB_MODE_FIB")
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            s = _img_state()
-            if s is not None and s.upper() == "FIB":
-                break
-            try:
-                if int(round(float(sem.get_float("DP_FIB_IMAGING")))) == 1:
-                    break
-            except Exception:
-                pass
-            time.sleep(poll_s)
-        else:
-            raise TimeoutError(
-                "Timed out waiting for DP_FIB_IMAGING=FIB after CMD_FIB_MODE_FIB"
-            )
+    from ..frame_grab import ensure_fib_imaging
+    ensure_fib_imaging(sem, timeout_s=timeout_s, poll_s=poll_s, log=log)
 
 
 # Real-instrument timing, measured on the Crossbeam 550 at 2000x.
 # The frame cycle time was ~1.3 s; these defaults add generous padding because a
 # too-short wait silently returns the PREVIOUS frame instead of erroring.
 DEFAULT_SETTLE_S = 1.0        # after changing objective voltage, before imaging
-DEFAULT_FRAME_WAIT_S = 3.0    # scanning time before freezing -> guarantees a fresh frame.
-                              # 5.0 was proven on the instrument; 3.0 confirmed OK there
-                              # and is still >2x the measured ~1.3 s frame cycle time.
+DEFAULT_FRAME_WAIT_S = 3.0    # v0.54.0: used ONLY when DP_FROZEN is unreadable; every
+                              # frame is otherwise frame_grab's single-frame protocol
+                              # (one pass, finished by an end-of-frame freeze).
 
 # Autofocus rasters the beam for tens of seconds and FIB imaging sputters, so we
 # focus on a throwaway patch: shift the beam off target, focus, shift back.
@@ -287,43 +266,6 @@ BEAM_SHIFT_X_MAX_M = 1.50e-05         # hard instrument limit (operator-supplied
 DEFAULT_BEAM_SHIFT_X_RETURN_M = 0.00  # return here when autofocus finishes
 
 
-def _is_frozen(sem) -> Optional[bool]:
-    """True/False if DP_FROZEN is readable, else None."""
-    try:
-        v = sem.get_str("DP_FROZEN").strip().lower()
-        if v in ("frozen", "1", "yes"):
-            return True
-        if v in ("live", "0", "no"):
-            return False
-    except Exception:
-        pass
-    try:
-        return int(round(float(sem.get_float("DP_FROZEN")))) == 1
-    except Exception:
-        return None
-
-
-def _wait_frozen(sem, timeout_s: float, poll_s: float = 0.2, log=None) -> None:
-    """Block until DP_FROZEN reports Frozen (i.e. the frame finished).
-
-    With DP_FREEZE_ON = End Frame, CMD_FREEZE_ZONE only takes effect at the end of
-    the current frame, so the framestore holds a COMPLETE frame once frozen. If
-    DP_FROZEN is unreadable this returns immediately -- the frame_wait padding is
-    then the only guarantee.
-    """
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        st = _is_frozen(sem)
-        if st is None:
-            return  # cannot read; rely on the time-based padding
-        if st:
-            return
-        time.sleep(poll_s)
-    if log:
-        log(f"[autofocus] WARNING: DP_FROZEN did not report Frozen within "
-            f"{timeout_s:.1f}s; the grabbed frame may be mid-scan.")
-
-
 class ScopeImageSource(ImageSource):
     """Real FIB adapter over SmartSEM. Instrument-untested; handle with care.
 
@@ -342,7 +284,7 @@ class ScopeImageSource(ImageSource):
         settle_s: float = DEFAULT_SETTLE_S,
         frame_wait_s: float = DEFAULT_FRAME_WAIT_S,
         freeze_on_end_frame: bool = True,
-        frozen_timeout_s: float = 15.0,
+        frozen_timeout_s: float = 60.0,
         fib_magnification: Optional[float] = DEFAULT_FIB_MAGNIFICATION,
         beam_shift_x_m: Optional[float] = DEFAULT_BEAM_SHIFT_X_M,
         beam_shift_x_return_m: float = DEFAULT_BEAM_SHIFT_X_RETURN_M,
@@ -521,7 +463,7 @@ class ScopeImageSource(ImageSource):
         #    does not stick), then set and READ BACK to verify. The pixel size read
         #    below depends on this mag being real.
         if self.fib_magnification is not None:
-            _ensure_fib_imaging(self._sem)
+            _ensure_fib_imaging(self._sem, log=self._log)
             self._assert_magnification("at prepare")
 
         # Live pixel size (exact; falls back to the constant if unavailable) and a
@@ -830,62 +772,48 @@ class ScopeImageSource(ImageSource):
         if not _HAVE_PIL:
             raise RuntimeError("Pillow is required to read grabbed BMP images.")
 
-        _ensure_fib_imaging(self._sem)
+        from ..frame_grab import (StaleFrameError, fib_mag_still, grab_fresh_frame,
+                                  is_stale_warning)
+        _ensure_fib_imaging(self._sem, log=self._log)
         # Check the mag before EVERY image: milling / mode switches can change it.
         self._assert_magnification("before grab")
 
-        # ORDER MATTERS. Grabbing straight after unfreeze returns the PREVIOUS
-        # frame: the framestore needs a full cycle (~1.3 s here) to refresh, and
-        # Grab() never errors -- it just hands back stale pixels. That made every
-        # sweep point identical and the focus curve flat. So:
-        #   unfreeze -> scan for frame_wait_s -> freeze at end of frame -> grab.
-        # Grabbing from a FROZEN framestore also avoids catching a half-scanned frame.
-        try:
-            self._sem.execute("CMD_UNFREEZE_ZONE")
-        except Exception:
-            pass
-
-        # Let the beam paint at least one complete, fresh frame.
-        time.sleep(self.frame_wait_s)
-
-        # Freeze (at end of frame) BEFORE grabbing: stops dose and stabilises the
-        # framestore. Do this outside `finally` so the grab reads a frozen buffer.
-        frozen_ok = True
-        try:
-            self._sem.execute("CMD_FREEZE_ZONE")
-        except Exception:
-            frozen_ok = False
-            try:
-                self._sem.execute("CMD_FREEZE_ALL")
-                frozen_ok = True
-            except Exception:
-                self._log("[autofocus] WARNING: freeze failed; grabbing live frame.")
-        if frozen_ok:
-            _wait_frozen(self._sem, self.frozen_timeout_s, log=self._log)
-
+        # v0.54.0: ONE frame by the shared single-frame protocol (End Frame read back ->
+        # unfreeze -> Live -> immediate end-of-frame freeze -> wait Frozen -> Grab). The
+        # old fixed 3 s live scan before the freeze is gone. The speed was set once in
+        # prepare(). A reduced raster scans less than AP_FRAME_TIME, so the "frame ended
+        # too soon" check is skipped while it is on. A frame that fails a check raises:
+        # a stale frame would score the PREVIOUS voltage.
+        if self.roi is not None:
+            xoff, yoff, w, h = self.roi
+        else:
+            rect = self._resolve_raster()
+            if rect is not None:
+                # Only the rastered region is refreshed; the rest of the
+                # framestore still holds stale pixels, which would drag the
+                # sharpness score toward a constant.
+                xoff, yoff, w, h = rect
+            else:
+                xoff, yoff, w, h = 0, 0, self.screen_size[0], self.screen_size[1]
         fd, path = tempfile.mkstemp(suffix=".bmp", prefix="pyfib_af_")
         os.close(fd)
         try:
-            if self.roi is not None:
-                xoff, yoff, w, h = self.roi
-            else:
-                rect = self._resolve_raster()
-                if rect is not None:
-                    # Only the rastered region is refreshed; the rest of the
-                    # framestore still holds stale pixels, which would drag the
-                    # sharpness score toward a constant.
-                    xoff, yoff, w, h = rect
-                else:
-                    xoff, yoff, w, h = self.screen_size[0], self.screen_size[1], 0, 0
-                    xoff, yoff, w, h = 0, 0, self.screen_size[0], self.screen_size[1]
-            self._sem.grab_bmp(
-                path,
-                xoff=xoff,
-                yoff=yoff,
-                width=w,
-                height=h,
-                reduction=self.grab_reduction,
-            )
+            warn = grab_fresh_frame(self._sem, path, xoff=xoff, yoff=yoff, width=w,
+                                    height=h, reduction=self.grab_reduction,
+                                    frame_wait_s=self.frame_wait_s,
+                                    frozen_timeout_s=self.frozen_timeout_s,
+                                    check_too_short=not self._reduced_applied,
+                                    log=self._log)
+            if is_stale_warning(warn):
+                raise StaleFrameError(f"autofocus frame not usable: {warn}")
+            if self.fib_magnification is not None:
+                ok, post = fib_mag_still(self._sem, float(self.fib_magnification),
+                                         MAG_VERIFY_REL_TOL)
+                if not ok and post is not None:
+                    raise RuntimeError(
+                        f"the FIB magnification read {post}x after the frame, not "
+                        f"{float(self.fib_magnification):g}x (the column changed during "
+                        f"the frame); the focus score would be wrong.")
             with Image.open(path) as im:
                 arr = np.asarray(im.convert("L"), dtype=np.float64)
         finally:

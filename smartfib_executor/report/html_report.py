@@ -783,6 +783,8 @@ def _refine_text(rf: Dict[str, Any]) -> str:
     sd = rf.get("stage_delta_um") or [0, 0]
     if sd and any(abs(x or 0) > 0 for x in sd):
         txt += f" · stage moved {_pair(sd)}"
+    if rf.get("speed_fallback_used"):
+        txt += f" · speed {_esc(rf.get('speed_fallback_scan_rate'))} retry used"
     if rf.get("coarse_fallback_tried"):
         cs = rf.get("coarse_stage_delta_um") or [0, 0]
         txt += " · 800x fallback used" + (

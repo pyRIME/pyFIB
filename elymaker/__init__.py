@@ -33,7 +33,7 @@ from .builder import LayoutBuilder
 from .probes import PROBES, get_probe
 from .validate import validate
 
-__version__ = "0.9.1"
+__version__ = "0.9.1+pyfib.1"   # pyFIB patch: rotated RECTs (see PYFIB_PATCHES.md)
 
 __all__ = [
     "Layout",

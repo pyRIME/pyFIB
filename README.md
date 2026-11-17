@@ -1,5 +1,8 @@
 # pyFIB (ZEISS Crossbeam / SmartSEM Remote API)
 
+**New users: start with the [pyFIB User Guide](docs/USER_GUIDE.md)** -- install, every tab,
+the safety rules, the command line and troubleshooting, with screenshots and diagrams.
+
 pyFIB is a minimal Python interface for two practical tasks on a ZEISS Crossbeam
 running SmartSEM / SmartFIB (via the SmartSEM Remote API / CZEMApi ActiveX control):
 
@@ -220,6 +223,54 @@ python -m pyfib site after-image position_12 --stage prepolish --positions-file 
 `push` loads + prepares the pattern in SmartFIB and never starts milling: check it and
 start milling in SmartFIB, then record the after image.
 
+### CLEM targeting with pyMap (v0.52.0, part 1)
+
+The **Correlation** tab (after GISDEP) works at SEM normal (T 30°, R 12°). pyMap
+registers the confocal and writes targets into `<session>\clem\`; pyFIB checks them and
+computes each target's stage X/Y. Nothing moves to a target yet.
+
+```
+python -m pyfib clem-overview --kind fib --grid Grid1 --positions-file S\positions.json --arm
+python -m pyfib clem-overview --kind sem --grid Grid1 --mag 200 --positions-file S\positions.json --arm
+python -m pyfib clem-targets --positions-file S\positions.json
+```
+
+Overviews refuse unless the stage is at SEM normal and SmartSEM is not milling, and never
+move the stage. `clem-targets` is files only and writes `clem\pyfib_clem_plan.json`.
+
+pyMap (v0.9.2 since pyFIB v0.55.0) is bundled as `pymap\` and opens in the tab's right
+pane; install its packages once with `python -m pip install -r requirements-pymap.txt`
+(again after v0.53.2: it adds `imagecodecs`, needed for LZW-compressed confocal TIFFs).
+**Open pyMap in own window** moves it into a window of its own (e.g. a second monitor);
+close that window to bring it back. ELYMaker has the same button. A new session no
+longer restarts pyMap (v0.55.0): it keeps its images and landmarks; open the FIB overview
+from the new session, and re-pick or clear landmarks from the old overview, before writing
+targets.
+
+If a button fails, pyFIB shows the error and keeps running (v0.53.2). Since v0.55.0 a
+hard crash is reported at the next start, a command that crashes natively is named as a
+crash, and closing pyFIB with a command running asks first. Everything goes to the
+`logs\` folder (Run menu > Open logs folder): `pyfib_gui_errors.log`, `pyfib_faults.log`,
+`pymap.log`, `pymap_hangs.log` -- please send the whole folder with a bug report.
+
+Since v0.55.1 a batch never resets the FIB beam shift while SmartSEM indicates milling
+(after a mill timeout, an error, or when the pyFIB window dies during a mill), the milling
+tabs have a **Mill timeout (min)** box (default 240), and the GISDEP tab reads the
+microscope only while it is on screen and no pyFIB command runs. See
+`test_scripts\MILL_SAFETY_TEST.txt`.
+
+**Mark targets (v0.53.0).** Card 4 of the Correlation tab mills the markup trenches
+(`Markup_Standard`, bundled centred on its tick = the lamella) on every ticked target in
+ONE SmartFIB layout, placed on the FIB overview and milled at the overview's position and
+magnification. The stage never moves; it must still be exactly where the overview was
+taken. **Edit in ELYMaker** shows the layout over the overview with the targets drawn in;
+a saved edit is milled as saved (Reset regenerates it).
+
+```
+python -m pyfib clem-markup --positions-file S\positions.json --targets T1,T3
+python -m pyfib clem-markup --positions-file S\positions.json --all --arm
+```
+
 ### About `CMD_FIB_MODE_MILL`
 
 Some systems expose `CMD_FIB_MODE_MILL`, but in practice it is **not usually required** to run a
@@ -267,9 +318,12 @@ Z correction, tilt ~2 deg and R 12 deg only; elsewhere the report warns). After 
 standard pattern with the current, depth, width and height of each part. Add `--mosaic`
 for a quarter-size mosaic of the 800x images placed by stage position (off by default).
 
-To get before/after pictures, tick **After-mill image** in any milling tab (Rough Mill, Prepolish, Polish) (or add
-`--after-image` to `mill-positions`): one FIB frame per site after milling, saved as
-`images\<name>_after_<time>.bmp`. It is off by default (one frame of ion dose per site).
+**After-mill image** (milling tabs; on by default since v0.51.0): one FIB frame per site
+after milling, saved as `images\<name>_<n>-<stage>_<time>.bmp`; the next stage aligns to
+it. Since v0.53.1 it first logs what SmartFIB left (imaging mode, FIB magnification,
+objective, probe readings), then sets FIB imaging, the capture magnification and the
+objective used for milling and reads both back; if either does not read back, the image
+is skipped with a warning. `<image>.bmp.json` records the read-backs.
 
 ## Safety
 
@@ -298,6 +352,11 @@ pattern finishes, try:
 
 - `--wait auto` (finishes when either `DP_FIB_MODE` changes OR `DP_FIB_BLANKED` becomes stably "Yes")
 - `--wait blanked` (finishes when `DP_FIB_BLANKED` becomes stably "Yes")
+
+Once a "finished" reading is seen it must hold for `--done-confirm-s` seconds before the
+site counts as done (CLI default 30 s). The milling tabs set it with **Confirm done (s)**,
+default 20 s, range 10-120 s (v0.52.2). If a reading flips back, the Log says
+`[confirm] Completion not stable after N s (window 20 s)`: N must stay well below the window.
 
 ## Debugging imaging mode switching (DP_FIB_IMAGING)
 

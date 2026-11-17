@@ -1,0 +1,27 @@
+EMBEDDED TOOLS: ELYMAKER PANELS, OWN WINDOWS, NO CRASHES (pyFIB v0.53.2)   about 10 min
+==============================================================================
+No instrument needed (ARM off). First, in the pyFIB folder:
+    python -m pip install -r requirements-pymap.txt
+(adds imagecodecs, needed for LZW-compressed TIFFs such as Maximum_Projection_overlay.tif)
+
+
+1) ELYMAKER, MAXIMISED                                                    3 min
+   ELYMaker tab: File -> load the FIB image and the .ely as before; Select tool; click a
+   shape. Expect: the window stays on the screen (probe legend, Validation box and
+   status bar visible). Tools on top (scrolls if short); Properties and New-shape
+   defaults are tabs below it; selecting a shape brings Properties to the front.
+
+
+2) OWN WINDOW                                                             3 min
+   ELYMaker tab -> "Open in own window": ELYMaker moves to its own window with the same
+   image and pattern; the tab says "ELYMaker is open in its own window". Drag it to the
+   other monitor and maximise. Close it -> ELYMaker is back in the tab, unchanged.
+   Correlation tab -> "Open pyMap in own window": same, with pyMap's images, landmarks
+   and targets kept. Write targets from there: the targets table on the left updates.
+
+
+3) THE CONFOCAL THAT CRASHED                                              2 min
+   pyMap -> Open Confocal -> Maximum_Projection_overlay.tif. Expect: it opens (RGB).
+   If anything fails now, pyFIB shows "pyFIB: an action failed" and keeps running.
+   Please send logs\pyfib_gui_errors.log (and logs\pyfib_faults.log if pyFIB still
+   closes) with a note of what you clicked.

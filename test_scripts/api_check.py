@@ -20,13 +20,22 @@ print("=" * 70)
 print("python  :", sys.version.split()[0], "|", sys.executable)
 
 # ---- 1) other python processes (a still-running serialFIB would show here) ----
+# v0.53.3: python.exe AND pythonw.exe; a "Remoting Forwarding Window" title is the ZEISS
+# API's hidden window, i.e. that process holds a SmartSEM connection.
 try:
-    out = subprocess.run(["tasklist", "/V", "/FI", "IMAGENAME eq python.exe"],
-                         capture_output=True, text=True, timeout=15).stdout
-    rows = [l for l in out.splitlines() if l.lower().startswith("python")]
-    print(f"python.exe processes: {len(rows)} (this check is one of them)")
-    for l in rows:
-        print("   ", " ".join(l.split())[:150])
+    for image in ("python.exe", "pythonw.exe"):
+        out = subprocess.run(["tasklist", "/V", "/FI", f"IMAGENAME eq {image}"],
+                             capture_output=True, text=True, timeout=15).stdout
+        rows = [l for l in out.splitlines() if l.lower().startswith(image[:-4])]
+        print(f"{image} processes: {len(rows)}"
+              + (" (this check is one of them)" if image == "python.exe" else ""))
+        for l in rows:
+            print("   ", " ".join(l.split())[:150])
+            if "remoting forwarding window" in l.lower():
+                print("    ^^^ holds a SmartSEM connection"
+                      + (" and is NOT RESPONDING: end it in Task Manager (Details) before "
+                         "running pyFIB" if "not responding" in l.lower() else
+                         " -- close that program before running pyFIB"))
 except Exception as e:
     print("tasklist failed:", e)
 
@@ -59,7 +68,13 @@ except Exception:
     traceback.print_exc()
     sys.exit(1)
 
-sem = SmartSEM()
+try:
+    sem = SmartSEM()           # v0.53.3: waits up to 20 s for another SmartSEM client
+except Exception as e:
+    print("NOT CONNECTED:", e)
+    sys.exit(1)
+print("connecting ... (if Python closes right here, the ZEISS API crashed while "
+      "connecting: send this output)")
 if LATE:
     sem.api = win32com.client.dynamic.Dispatch(CZEMAPI_CLSID)
 cls = type(sem.api)

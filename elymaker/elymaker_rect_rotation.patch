@@ -1,0 +1,493 @@
+diff -ruN elymaker/__init__.py elymaker/__init__.py
+--- elymaker/__init__.py	2026-10-20 14:19:48.816025067 -0500
++++ elymaker/__init__.py	2026-10-20 14:21:34.412239170 -0500
+@@ -33,7 +33,7 @@
+ from .probes import PROBES, get_probe
+ from .validate import validate
+ 
+-__version__ = "0.9.1"
++__version__ = "0.9.1+pyfib.1"   # pyFIB patch: rotated RECTs (see PYFIB_PATCHES.md)
+ 
+ __all__ = [
+     "Layout",
+diff -ruN elymaker/geometry.py elymaker/geometry.py
+--- elymaker/geometry.py	2026-10-20 14:19:48.816061424 -0500
++++ elymaker/geometry.py	2026-10-20 14:21:01.613276055 -0500
+@@ -101,3 +101,36 @@
+         else:
+             pts.append(C)
+     return pts
++
++
++# --------------------------------------------------------------------------- #
++# Rotated RECT geometry (pyFIB patch 0.9.1+pyfib.1, 2026-10-20)
++# --------------------------------------------------------------------------- #
++# MEASURED in SmartFIB (Crossbeam 550, 2026-10-20, pyFIB_rotation_test.ely: 12 x 2 um
++# bars at 30 deg, one with height +2 and one with height -2): SmartFIB rotates a RECT
++# about the CENTRE of its unrotated box, COUNTER-CLOCKWISE for a positive angle (layout
++# y up, as SmartFIB displays it). The box itself is unchanged by the angle: it runs
++# from the anchor (x, y) by the signed width and height. Confirmed on 8 milled waffle
++# sites (2026-10-16): the 270 deg hinge slots were milled at the centre-pivot places.
++# Before this patch elymaker drew rotated RECTs CLOCKWISE about the anchor.
++
++
++def rect_center(x: float, y: float, width: float, height: float) -> Tuple[float, float]:
++    """Centre of a RECT's box in layout um (the rotation pivot)."""
++    return (x + width / 2.0, y + height / 2.0)
++
++
++def rect_corners(x: float, y: float, width: float, height: float,
++                 angle_deg: float = 0.0) -> List[Tuple[float, float]]:
++    """The four corners of a RECT in layout um (y up), as SmartFIB places them.
++
++    Vertex order is SmartFIB's (P0=(x,y), P1=(x+w,y), P2=(x+w,y+h), P3=(x,y+h)),
++    each rotated counter-clockwise by ``angle_deg`` about the box centre."""
++    cx, cy = rect_center(x, y, width, height)
++    a = math.radians(float(angle_deg))
++    ca, sa = math.cos(a), math.sin(a)
++    out = []
++    for px, py in ((x, y), (x + width, y), (x + width, y + height), (x, y + height)):
++        dx, dy = px - cx, py - cy
++        out.append((cx + dx * ca - dy * sa, cy + dx * sa + dy * ca))
++    return out
+diff -ruN elymaker/gui/coords.py elymaker/gui/coords.py
+--- elymaker/gui/coords.py	2026-10-20 14:19:48.814885503 -0500
++++ elymaker/gui/coords.py	2026-10-20 14:21:34.410893328 -0500
+@@ -40,22 +40,21 @@
+ 
+ 
+ def layout_angle_to_scene(angle_deg: float) -> float:
+-    """Convert a layout rotation (CCW in y-up) to a scene rotation (y-down).
++    """Convert a layout RECT angle to a Qt item rotation (scene, y-down).
+ 
+-    Flipping the y axis reverses the sense of rotation, so a CCW layout angle
+-    becomes a CW scene angle. Qt's item rotation is clockwise-positive, which
+-    means the scene angle we want is simply the layout angle unchanged in
+-    magnitude but interpreted in Qt's frame; the net effect of the double flip
+-    (y-sign and Qt's CW-positive) is that the numeric value is preserved. We
+-    keep this as an explicit function so the reasoning is documented and any
+-    future correction lives in one spot.
++    MEASURED in SmartFIB (2026-10-20): a positive RECT angle turns the box
++    COUNTER-CLOCKWISE as displayed (layout y up). The scene shows the layout with y
++    flipped back, so on screen that is counter-clockwise too, and Qt's item rotation
++    is clockwise-positive on screen -- hence the sign change. (pyFIB patch
++    0.9.1+pyfib.1: this used to return the angle unchanged, which drew every rotated
++    RECT turned the wrong way.)
+     """
+-    return angle_deg
++    return -float(angle_deg)
+ 
+ 
+ def scene_angle_to_layout(angle_deg: float) -> float:
+     """Inverse of :func:`layout_angle_to_scene`."""
+-    return angle_deg
++    return -float(angle_deg)
+ 
+ 
+ @dataclass
+diff -ruN elymaker/gui/items.py elymaker/gui/items.py
+--- elymaker/gui/items.py	2026-10-20 14:19:48.815539608 -0500
++++ elymaker/gui/items.py	2026-10-20 14:21:34.411750667 -0500
+@@ -321,16 +321,20 @@
+ class RectItem(QGraphicsObject, ShapeItemMixin):
+     """Editable rectangle. Position = anchor (layout x,y); rotation via Qt.
+ 
+-    The rect is drawn centred on its origin with the model width/height so that
+-    Qt's item rotation pivots about the anchor, matching how SmartFIB rotates a
+-    box about its placement point.
++    The box is drawn from its anchor (local 0,0) by the signed width/height. Qt's
++    rotation pivots about the box CENTRE (the item's transform origin, kept at the
++    centre whenever the size changes) and turns counter-clockwise on screen for a
++    positive layout angle -- how SmartFIB places a rotated RECT (measured
++    2026-10-20; pyFIB patch 0.9.1+pyfib.1: this used to pivot about the anchor and
++    turn clockwise). pos() stays the UNROTATED anchor, which is what the file stores.
+     """
+ 
+     def __init__(self, width: float, height: float) -> None:
+         QGraphicsObject.__init__(self)
+         ShapeItemMixin.__init__(self)
+-        self.width = float(width)
+-        self.height = float(height)          # signed (SmartFIB convention)
++        self._w = float(width)
++        self._h = float(height)              # signed (SmartFIB convention)
++        self._sync_origin()
+         self.imaging = False
+         self.edge_sel_auto_scan_angle = True
+         self.edge_sel_marked_edge: Optional[int] = None
+@@ -342,6 +346,29 @@
+             | QGraphicsItem.ItemSendsGeometryChanges
+         )
+ 
++    # -- size: keep the rotation pivot at the box centre --------------------- #
++    @property
++    def width(self) -> float:
++        return self._w
++
++    @width.setter
++    def width(self, value: float) -> None:
++        self._w = float(value)
++        self._sync_origin()
++
++    @property
++    def height(self) -> float:
++        return self._h
++
++    @height.setter
++    def height(self, value: float) -> None:
++        self._h = float(value)
++        self._sync_origin()
++
++    def _sync_origin(self) -> None:
++        """Rotation pivot = box centre (local), as SmartFIB rotates a RECT."""
++        self.setTransformOriginPoint(QPointF(self._w / 2.0, -self._h / 2.0))
++
+     # vertices in SmartFIB order, expressed in local (y-down) coords:
+     # layout offset (dx,dy) from the anchor maps to local (dx, -dy).
+     def _edge_corners_local(self):
+@@ -681,9 +708,11 @@
+     (through the origin). ``axis='x'`` reflects vertically (y -> -y);
+     ``axis='y'`` reflects horizontally (x -> -x).
+ 
+-    Exact for polygons and axis-aligned rects/text/arcs; for a rotated rect the
+-    anchor is reflected and the angle negated/adjusted (correct for the common
+-    axis-aligned lamella case).
++    Exact for polygons, rects (rotated or not), text and arcs. A rect's box is
++    reflected and re-formed (top-left anchor, w>0, h<0) about the same centre, and
++    its angle negated (x) or set to 180-angle (y): with SmartFIB's rotation about
++    the box centre both give the exact mirror image of the footprint (pyFIB patch
++    0.9.1+pyfib.1; with the old anchor pivot this was only right at 0 deg).
+     """
+     import copy as _copy
+     s = _copy.deepcopy(shape)
+@@ -720,8 +749,10 @@
+ def layout_bbox(shape: Shape):
+     """Axis-aligned bounding box of a model shape in layout um: (x0,y0,x1,y1)."""
+     if isinstance(shape, Rect):
+-        xs = [shape.x, shape.x + shape.width]
+-        ys = [shape.y, shape.y + shape.height]
++        from ..geometry import rect_corners
++        pts = rect_corners(shape.x, shape.y, shape.width, shape.height, shape.angle_deg)
++        xs = [p[0] for p in pts]
++        ys = [p[1] for p in pts]
+     elif isinstance(shape, Polygon):
+         xs = [p[0] for p in shape.points] or [0.0]
+         ys = [p[1] for p in shape.points] or [0.0]
+diff -ruN elymaker/gui/properties.py elymaker/gui/properties.py
+--- elymaker/gui/properties.py	2026-10-20 14:19:48.815110025 -0500
++++ elymaker/gui/properties.py	2026-10-20 14:21:34.411256214 -0500
+@@ -29,7 +29,7 @@
+ 
+ from ..probes import PROBES, get_probe, probe_names_by_current
+ from ..model import Exposure
+-from .coords import layout_to_scene, scene_to_layout, scene_angle_to_layout
++from .coords import layout_to_scene, scene_to_layout, scene_angle_to_layout, layout_angle_to_scene
+ from .items import ArcItem, PolygonItem, RectItem, TextItem
+ from .widgets import EdgeSelector
+ 
+@@ -200,7 +200,7 @@
+             item.setPos(sx, sy)
+             item.width = self.w.value()
+             item.height = self.h.value()
+-            item.setRotation(self.angle.value())
++            item.setRotation(layout_angle_to_scene(self.angle.value()))
+             item.imaging = self.imaging.isChecked()
+             item.ignored = self.ignored.isChecked()
+             item.set_marked_edge_dir(self.marked_edge.direction())
+diff -ruN elymaker/preview.py elymaker/preview.py
+--- elymaker/preview.py	2026-10-20 14:19:48.814787606 -0500
++++ elymaker/preview.py	2026-10-20 14:21:34.409996122 -0500
+@@ -5,8 +5,10 @@
+ a generated pattern before opening SmartFIB. It never touches the instrument.
+ 
+ Screen convention: SmartFIB layout y increases upward; SVG y increases downward,
+-so we flip y. Rectangles are drawn about their anchor with their (signed) height,
+-matching how the box grows in the file.
++so we flip y. A rectangle's box runs from its anchor by the signed width and height,
++matching how the box grows in the file; a rotated rectangle turns counter-clockwise
++about the box centre, as SmartFIB places it (geometry.rect_corners; pyFIB patch
++0.9.1+pyfib.1 -- before it, rotation was drawn about the anchor).
+ """
+ 
+ from __future__ import annotations
+@@ -14,6 +16,7 @@
+ import math
+ from typing import List, Optional, Tuple
+ 
++from .geometry import rect_center, rect_corners
+ from .model import Arc, Layout, Polygon, Rect, Shape, Text
+ 
+ 
+@@ -22,9 +25,10 @@
+     ys: List[float] = []
+     for _st, lref, sh in layout.iter_shapes():
+         if isinstance(sh, Rect):
+-            # (x,y) is the anchor corner; box extends by signed (width, height)
+-            xs += [sh.x, sh.x + sh.width]
+-            ys += [sh.y, sh.y + sh.height]
++            # the corners as SmartFIB places them (rotation about the box centre)
++            pts = rect_corners(sh.x, sh.y, sh.width, sh.height, sh.angle_deg)
++            xs += [p[0] for p in pts]
++            ys += [p[1] for p in pts]
+         elif isinstance(sh, Polygon):
+             xs += [p[0] for p in sh.points]
+             ys += [p[1] for p in sh.points]
+@@ -97,23 +101,15 @@
+ 
+         if isinstance(sh, Rect):
+             # (x,y) is the anchor corner; the box extends by signed (width,
+-            # height) and rotates about that corner. Draw corners relative to
+-            # the anchor: (0,0) .. (w,h), then rotate and translate.
+-            corners = [(0.0, 0.0), (sh.width, 0.0), (sh.width, sh.height), (0.0, sh.height)]
+-            a = math.radians(sh.angle_deg)
+-            ca, sa = math.cos(a), math.sin(a)
+-            pts = []
+-            for dx, dy in corners:
+-                rx = dx * ca - dy * sa + sh.x
+-                ry = dx * sa + dy * ca + sh.y
+-                pts.append("%.2f,%.2f" % (sx(rx), sy(ry)))
++            # height) and SmartFIB rotates it counter-clockwise about its centre.
++            pts = ["%.2f,%.2f" % (sx(rx), sy(ry))
++                   for rx, ry in rect_corners(sh.x, sh.y, sh.width, sh.height,
++                                              sh.angle_deg)]
+             parts.append('<polygon points="%s" fill="%s" fill-opacity="%s" stroke="%s"%s/>'
+                          % (" ".join(pts), color, opacity, color, dash))
+             if sh.imaging:
+-                # imaging marker at the box centre
+-                cdx, cdy = sh.width / 2.0, sh.height / 2.0
+-                ccx = cdx * ca - cdy * sa + sh.x
+-                ccy = cdx * sa + cdy * ca + sh.y
++                # imaging marker at the box centre (the pivot: unchanged by rotation)
++                ccx, ccy = rect_center(sh.x, sh.y, sh.width, sh.height)
+                 parts.append('<circle cx="%.1f" cy="%.1f" r="3" fill="#ffd166"/>'
+                              % (sx(ccx), sy(ccy)))
+ 
+diff -ruN elymaker/validate.py elymaker/validate.py
+--- elymaker/validate.py	2026-10-20 14:19:48.816136298 -0500
++++ elymaker/validate.py	2026-10-20 14:21:34.410504643 -0500
+@@ -14,6 +14,7 @@
+ import math
+ from typing import List
+ 
++from .geometry import rect_corners
+ from .model import Arc, Layout, Polygon, Rect, Shape, Text, DOSE_TO_METRE
+ 
+ _Z_TOL = 1e-12   # metres; tolerance on z_extent == dose_factor*1e-6
+@@ -26,12 +27,15 @@
+ def _extent(sh: Shape):
+     """Return (xmin, xmax, ymin, ymax) in um, or None if not applicable.
+ 
+-    Rect extent ignores rotation (axis-aligned bound about its anchor); good
+-    enough for a coarse field-of-view check.
++    Rect: the corners as SmartFIB places them (anchor box rotated about its centre;
++    pyFIB patch 0.9.1+pyfib.1 -- this used to treat (x, y) as the centre and ignore
++    the angle).
+     """
+     if isinstance(sh, Rect):
+-        hw, hh = abs(sh.width) / 2.0, abs(sh.height) / 2.0
+-        return (sh.x - hw, sh.x + hw, sh.y - hh, sh.y + hh)
++        pts = rect_corners(sh.x, sh.y, sh.width, sh.height, sh.angle_deg)
++        xs = [p[0] for p in pts]
++        ys = [p[1] for p in pts]
++        return (min(xs), max(xs), min(ys), max(ys))
+     if isinstance(sh, Polygon):
+         if not sh.points:
+             return None
+--- /dev/null
++++ elymaker_tests/test_v091_rect_rotation.py	2026-10-20 14:25:23.361271563 -0500
+@@ -0,0 +1,196 @@
++"""Rotated RECTs as SmartFIB places them (pyFIB patch 0.9.1+pyfib.1, 2026-10-20).
++
++MEASURED in SmartFIB (Crossbeam 550): ``fixtures_pyfib/pyFIB_rotation_test.ely`` holds two
++12 x 2 um bars at 30 deg (test A: anchor (-19, -1), height +2; test B: anchor (7, 1),
++height -2) plus small unrotated marker squares at each bar's unrotated corners and
++centre. Opened in SmartFIB, both bars pass through their CENTRE markers and rise to
++the right: rotation is about the box centre, counter-clockwise for a positive angle.
++``fixtures_pyfib/pyFIB_waffle.ely``: the two 270 deg hinge slots were milled (8 sites,
++2026-10-16) at x -9.49..-7.49 um, y -0.45..-0.25 and +0.39..+0.59 um.
++
++Before the patch elymaker drew rotated RECTs clockwise about the anchor (test A's far
++end ~10 um from where SmartFIB puts it).
++"""
++
++import math
++import os
++
++import pytest
++
++from elymaker.geometry import rect_center, rect_corners
++from elymaker.model import Layer, LayerReference, Layout, Rect, Structure
++from elymaker.reader import read_ely
++
++HERE = os.path.dirname(__file__)
++# kept out of fixtures/ (test_roundtrip counts the 12 example files there)
++ROT_TEST = os.path.join(HERE, "fixtures_pyfib", "pyFIB_rotation_test.ely")
++WAFFLE = os.path.join(HERE, "fixtures_pyfib", "pyFIB_waffle.ely")
++
++
++def _R(**kw):
++    kw.setdefault("dose_factor", 1.0)
++    kw.setdefault("z_extent_m", 1.0e-6)
++    return Rect(**kw)
++
++
++def _rects(path):
++    lay = read_ely(path)
++    return [s for st in lay.structures for lr in st.layer_refs for s in lr.shapes
++            if isinstance(s, Rect)]
++
++
++def _rotated(path):
++    return [r for r in _rects(path) if r.angle_deg % 360]
++
++
++def _close(a, b, tol=1e-9):
++    return all(abs(p - q) <= tol for pa, pb in zip(a, b) for p, q in zip(pa, pb))
++
++
++# ------------------------------------------------------------------ the rule
++def test_rotation_test_bars_turn_ccw_about_their_centre():
++    bars = _rotated(ROT_TEST)
++    assert len(bars) == 2
++    for r in bars:
++        cx, cy = rect_center(r.x, r.y, r.width, r.height)
++        pts = rect_corners(r.x, r.y, r.width, r.height, r.angle_deg)
++        # the pivot is the centre: the corners average to it
++        assert abs(sum(p[0] for p in pts) / 4 - cx) < 1e-9
++        assert abs(sum(p[1] for p in pts) / 4 - cy) < 1e-9
++        # counter-clockwise: the right-hand end of the bar is ABOVE the centre
++        right = max(pts, key=lambda p: p[0])
++        assert right[1] > cy + 2.0
++        # the long axis runs at +30 deg
++        p0, p1 = pts[0], pts[1]
++        assert abs(math.degrees(math.atan2(p1[1] - p0[1], p1[0] - p0[0])) - 30.0) < 1e-9
++
++
++def test_rotation_test_exact_corners():
++    a, b = sorted(_rotated(ROT_TEST), key=lambda r: r.x)
++    # test A: anchor (-19,-1), w 12, h +2 -> centre (-13, 0)
++    want_a = [(-17.696152, -3.866025), (-7.303848, 2.133975),
++              (-8.303848, 3.866025), (-18.696152, -2.133975)]
++    # test B: anchor (7,1), w 12, h -2 -> centre (13, 0)
++    want_b = [(7.303848, -2.133975), (17.696152, 3.866025),
++              (18.696152, 2.133975), (8.303848, -3.866025)]
++    assert _close(rect_corners(a.x, a.y, a.width, a.height, a.angle_deg), want_a, 1e-5)
++    assert _close(rect_corners(b.x, b.y, b.width, b.height, b.angle_deg), want_b, 1e-5)
++
++
++def test_zero_angle_is_the_plain_box():
++    assert _close(rect_corners(2.0, 3.0, 4.0, -1.5, 0.0),
++                  [(2.0, 3.0), (6.0, 3.0), (6.0, 1.5), (2.0, 1.5)])
++
++
++def test_waffle_hinge_slots_land_where_they_were_milled():
++    slots = sorted(_rotated(WAFFLE), key=lambda r: r.y)
++    assert len(slots) == 2 and all(r.angle_deg == 270.0 for r in slots)
++    measured = [(-9.49, -7.49, -0.45, -0.25), (-9.48, -7.48, 0.39, 0.59)]
++    for r, (x0, x1, y0, y1) in zip(slots, measured):
++        pts = rect_corners(r.x, r.y, r.width, r.height, r.angle_deg)
++        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
++        assert abs(min(xs) - x0) < 0.01 and abs(max(xs) - x1) < 0.01
++        assert abs(min(ys) - y0) < 0.01 and abs(max(ys) - y1) < 0.01
++
++
++# ------------------------------------------------------------------ users of the rule
++def test_validate_extent_and_preview_bounds_use_the_rotated_corners():
++    from elymaker.preview import _bounds
++    from elymaker.validate import _extent
++    r = _rotated(ROT_TEST)[0]
++    pts = rect_corners(r.x, r.y, r.width, r.height, r.angle_deg)
++    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
++    assert _close([_extent(r)], [(min(xs), max(xs), min(ys), max(ys))])
++    lay = Layout(name="t", layers=[Layer(name="L")],
++                 structures=[Structure(name="S", layer_refs=[
++                     LayerReference(ref="L", shapes=[r])])])
++    assert _close([_bounds(lay)], [(min(xs), min(ys), max(xs), max(ys))])
++
++
++def test_preview_draws_the_bar_rising_to_the_right():
++    import re
++    from elymaker.preview import to_svg
++    r = _rotated(ROT_TEST)[0]
++    lay = Layout(name="t", layers=[Layer(name="L")],
++                 structures=[Structure(name="S", layer_refs=[
++                     LayerReference(ref="L", shapes=[r])])])
++    svg = to_svg(lay)
++    pts = [tuple(float(v) for v in xy.split(","))
++           for xy in re.search(r'<polygon points="([^"]+)"', svg).group(1).split()]
++    assert len(pts) == 4
++    right, left = max(pts), min(pts)
++    assert right[1] < left[1]          # SVG y is down: the right end is higher
++
++
++@pytest.mark.parametrize("axis", ["x", "y"])
++@pytest.mark.parametrize("angle", [0.0, 30.0, 90.0, 145.0, 270.0, -20.0])
++@pytest.mark.parametrize("h", [2.0, -2.0])
++def test_mirror_is_exact_for_rotated_rects(axis, angle, h):
++    from elymaker.gui.items import mirror_shape_model
++    r = _R(x=-19.0, y=-1.0, width=12.0, height=h, angle_deg=angle)
++    m = mirror_shape_model(r, axis)
++    fx, fy = (-1.0, 1.0) if axis == "y" else (1.0, -1.0)
++    want = sorted((round(px * fx, 6), round(py * fy, 6))
++                  for px, py in rect_corners(r.x, r.y, r.width, r.height, r.angle_deg))
++    got = sorted((round(px, 6), round(py, 6))
++                 for px, py in rect_corners(m.x, m.y, m.width, m.height, m.angle_deg))
++    assert got == want
++
++
++# ------------------------------------------------------------------ the GUI
++def test_coords_angle_sign():
++    from elymaker.gui.coords import layout_angle_to_scene, scene_angle_to_layout
++    assert layout_angle_to_scene(30.0) == -30.0
++    assert scene_angle_to_layout(layout_angle_to_scene(270.0)) == 270.0
++
++
++def _gui_corners(it):
++    from elymaker.gui.coords import scene_to_layout
++    return [scene_to_layout(p.x(), p.y())
++            for p in (it.mapToScene(q) for q in it._edge_corners_local())]
++
++
++@pytest.mark.parametrize("angle", [0.0, 30.0, 90.0, 180.0, 270.0, -45.0, 400.0])
++@pytest.mark.parametrize("h", [2.0, -2.0])
++def test_gui_rect_draws_where_smartfib_does_and_round_trips(qapp, angle, h):
++    from elymaker.gui.items import RectItem
++    r = _R(x=-19.0, y=-1.0, width=12.0, height=h, angle_deg=angle)
++    it = RectItem.from_model(r)
++    assert _close(_gui_corners(it), rect_corners(r.x, r.y, r.width, r.height, angle), 1e-6)
++    m = it.to_model()
++    assert (m.x, m.y, m.width, m.height) == (r.x, r.y, r.width, r.height)
++    assert m.angle_deg == angle                       # the file value is unchanged
++    c = it.center_layout()
++    assert abs(c[0] - (-13.0)) < 1e-6 and abs(c[1] - (-1.0 + h / 2)) < 1e-6
++
++
++def test_gui_resizing_a_rotated_rect_keeps_the_anchor_and_pivots_about_the_new_centre(qapp):
++    from elymaker.gui.items import RectItem
++    it = RectItem.from_model(_R(x=1.0, y=2.0, width=6.0, height=-2.0, angle_deg=30.0))
++    it.width = 10.0
++    it.height = -4.0
++    m = it.to_model()
++    assert (m.x, m.y, m.width, m.height, m.angle_deg) == (1.0, 2.0, 10.0, -4.0, 30.0)
++    assert _close(_gui_corners(it), rect_corners(1.0, 2.0, 10.0, -4.0, 30.0), 1e-6)
++
++
++def test_gui_scene_round_trip_of_the_rotation_test_file(qapp):
++    from elymaker.gui.items import RectItem
++    for r in _rects(ROT_TEST):
++        m = RectItem.from_model(r).to_model()
++        assert (m.x, m.y, m.width, m.height, m.angle_deg) == \
++            (r.x, r.y, r.width, r.height, r.angle_deg)
++
++
++def test_properties_panel_angle_turns_the_box_ccw_and_is_saved_as_typed(qapp):
++    from elymaker.gui.items import RectItem
++    from elymaker.gui.properties import PropertiesPanel
++    it = RectItem.from_model(_R(x=-19.0, y=-1.0, width=12.0, height=2.0, angle_deg=0.0))
++    panel = PropertiesPanel()
++    panel.set_item(it)
++    panel.angle.setValue(30.0)
++    m = it.to_model()
++    assert m.angle_deg == pytest.approx(30.0)
++    assert _close(_gui_corners(it), rect_corners(-19.0, -1.0, 12.0, 2.0, 30.0), 1e-6)
++    panel.set_item(it)                                   # re-read: shows what was typed
++    assert panel.angle.value() == pytest.approx(30.0)

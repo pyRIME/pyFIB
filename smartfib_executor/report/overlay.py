@@ -7,9 +7,9 @@ image exactly where the operator saw it while authoring:
     layout (um, y up, origin = FOV centre)  ->  image pixels (origin top-left, y down)
         px = W/2 + x / ps          py = H/2 - y / ps          (ps = um per pixel)
 
-    RECT: (x, y) is the ANCHOR corner. In elymaker's y-down scene the box spans
-    local (0, 0)..(w, -h) and is rotated by angle_deg about the anchor with Qt's
-    rotation (x' = x cos a - y sin a, y' = x sin a + y cos a).
+    RECT: (x, y) is the ANCHOR corner; the box runs from it by the signed w, h and
+    is rotated by angle_deg COUNTER-CLOCKWISE about the box CENTRE, as SmartFIB
+    places it (v0.54.3, bug #17: measured 2026-10-20; was clockwise about the anchor).
     POLYGON: points as written.  ARC: the band elymaker draws (r1 from a1 to a2,
     then r2 back).  TEXT: centred on its anchor, as elymaker shows it.
 
@@ -80,15 +80,21 @@ def layout_to_pixel(x_um: float, y_um: float, pixel_size_um: float,
 
 def rect_corners_layout(x: float, y: float, w: float, h: float,
                         angle_deg: float) -> List[Point]:
-    """The four corners of an .ely RECT in layout um (y up), elymaker's convention."""
+    """The four corners of an .ely RECT in layout um (y up), as SmartFIB places them.
+
+    v0.54.3 (bug #17): the box runs from the anchor (x, y) by the signed w, h, and
+    SmartFIB rotates it COUNTER-CLOCKWISE about the box CENTRE (measured 2026-10-20 with
+    pyFIB_rotation_test.ely; the 270 deg waffle hinge slots were milled there too). This
+    used to rotate clockwise about the anchor. Same rule as the bundled elymaker's
+    geometry.rect_corners (pyFIB patch 0.9.1+pyfib.1); a test keeps the two equal.
+    Vertex order: (x,y), (x+w,y), (x+w,y+h), (x,y+h)."""
+    cx, cy = x + w / 2.0, y + h / 2.0
     a = math.radians(float(angle_deg))
     ca, sa = math.cos(a), math.sin(a)
-    sx0, sy0 = x, -y                                  # anchor in scene (y down)
     out = []
-    for lx, ly in ((0.0, 0.0), (w, 0.0), (w, -h), (0.0, -h)):   # local scene coords
-        rx = lx * ca - ly * sa
-        ry = lx * sa + ly * ca
-        out.append((sx0 + rx, -(sy0 + ry)))          # back to layout (y up)
+    for px, py in ((x, y), (x + w, y), (x + w, y + h), (x, y + h)):
+        dx, dy = px - cx, py - cy
+        out.append((cx + dx * ca - dy * sa, cy + dx * sa + dy * ca))
     return out
 
 

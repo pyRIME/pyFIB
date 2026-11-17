@@ -1,0 +1,84 @@
+SINGLE FRAME + SWITCH TO FIB + REFINE AT SPEED 3 (pyFIB v0.54.0)        about 30-40 min
+==============================================================================
+Why: every pyFIB frame (capture, after image, refine, FIB autofocus, CLEM overviews) is
+now ONE pass: freeze-on End Frame is read back, the scan is unfrozen, the end-of-frame
+freeze is requested at once, pyFIB waits for Frozen (up to 2 x AP_FRAME_TIME), then
+Grab(). Before, it scanned live for a fixed 3 s (about 8 frames at speed 3). The switch
+to FIB imaging now waits for SmartSEM's magnification reset (bug #14) before setting the
+magnification. Prepolish / Polish refine at speed 3, with one automatic retry at speed 8.
+
+Do it all on ONE SACRIFICIAL SITE (a broken lamella, e.g. position_16) with your usual
+FIB imaging probe (30kV:20pA). Use a scratch positions file for steps 1-3 so your
+session is not touched, e.g.  --positions-file C:\pyfib_test\single_frame\positions.json
+(make the folder first). In SmartSEM: Frames to average = 1 as you have it now.
+Never press a pyFIB button while a mill is running.
+
+Every frame prints one line in the Log / terminal:
+    [frame] speed N, AP_FRAME_TIME x s, Live -> Frozen y s
+Send those lines; y should be close to x (one frame).
+
+0) READ ONLY (sends nothing). With FIB imaging on at the sacrificial site:
+     python -m smartfib_executor.cli debug-fib-imaging
+   Send the BEFORE line. It now includes AP_FIB_MAGNIFICATION, AP_FRAME_TIME,
+   DP_SCANRATE and DP_FREEZE_ON (expect DP_FREEZE_ON = 0 'End Frame' or similar).
+   If DP_FREEZE_ON reads anything but End Frame (or cannot be read), STOP and send it:
+   every grab will refuse with "DP_FREEZE_ON reads ..., not End Frame".
+
+1) ONE FRAME AT SPEED 3. In SmartSEM set scan speed 3, then:
+     python -m smartfib_executor.cli capture-position sf_speed3 --positions-file C:\pyfib_test\single_frame\positions.json --arm
+   Watch SmartSEM: the image updates ONCE and stays frozen.
+   Expect: [frame] speed 3, AP_FRAME_TIME 0.36 s, Live -> Frozen ~0.4 s
+   (no "[fib] switched" line if FIB imaging was already on).
+
+2) SPEED 5 AND 8. Set speed 5 in SmartSEM, repeat with name sf_speed5; then speed 8,
+   name sf_speed8. Expect Live -> Frozen close to AP_FRAME_TIME each time (speed 8
+   ~10 s) and one pass in SmartSEM. Send the three [frame] lines and say if you saw more
+   than one pass anywhere.
+   If a capture refuses with "DP_FROZEN did not report Frozen" right after you changed the
+   speed, send that line (it means AP_FRAME_TIME followed the speed late), wait a few
+   seconds and repeat.
+
+3) SWITCH WITHOUT SmartFIB (cheap). Switch SmartSEM to SEM imaging by hand, set speed 3,
+   then repeat step 1 with name sf_switch. Expect one line like
+     [fib] switched to FIB imaging (was 'SEM'): on after 0.xx s; FIB magnification
+     unchanged at 2000x; steady for 1 s by +1.6 s
+   (or "A -> B at +t s" if the magnification moved). Then the capture as in step 1.
+
+4) THE #14 CASE: AFTER A SmartFIB MILL. In the Prepolish (or Polish) tab, on the
+   sacrificial site, mill your usual stage pattern in SmartFIB (Push pattern, start it
+   in SmartFIB), and when it has finished press Record after image.
+   Expect, before the magnification is set:
+     [fib] switched to FIB imaging (was 'SEM'): on after ... ; FIB magnification
+     2000x -> 175.9x at +t s; steady for 1 s by +T s
+   then "[after-image] FIB 2000x (read back 2000x) ..." and one [frame] line, and NO
+   "the column changed during the frame". Send the [fib] line -- t is the measured delay
+   of SmartSEM's reset (it decides whether 0.5 s + 1 s steady is enough).
+   If you do see "the column changed during the frame ... taking one more frame", pyFIB
+   retook it once; send the whole Log.
+
+5) REFINE AT SPEED 3 (Prepolish or Polish tab, same site). The new "Refine scan rate" box
+   shows 3 ("AF scan rate" is the old box, still 8). Go to, then Align.
+   Expect:
+     [refine] position_N: 2000x pass at scan speed 3 (fallback speed 8)
+     [frame] speed 3, ... (one per refine frame)
+     [refine] position_N: aligned via ...; residual 0.0x um
+     [refine] position_N: refine took N s (scan speed 3)
+   and the scan speed back to what it was before Align. Send the Log.
+
+6) THE SPEED-8 RETRY (forced: a speed too fast to correlate). In a terminal, same site:
+     python -m smartfib_executor.cli site align position_N --stage prepolish --refine-scan-rate 1 --positions-file <your session positions.json> --arm
+   Expect a low correlation SNR at speed 1, then
+     [refine] position_N: speed 1 did not correlate (Low confidence: ...); beam shift put
+     back to (...) um; retrying the 2000x pass at speed 8.
+     [refine] position_N: speed-8 retry OK: ...
+   If speed 1 still correlates (SNR >= 4) there is no retry -- just send the Log.
+   (Use --stage polish instead if the site is in Polish.)
+
+7) ONE FIB AUTOFOCUS (Tools tab -> FIB autofocus, "From last position", your usual
+   settings) on the same site. Expect one [frame] line per sweep point (speed 8, reduced
+   raster: Live -> Frozen may be shorter than AP_FRAME_TIME -- the too-short check is
+   off for autofocus), one pass per point in SmartSEM, and a converged focus.
+
+Afterwards you can delete C:\pyfib_test\single_frame.
+If any step refuses, the message names what it read (e.g. "the frame ended too soon for
+this scan speed twice (Live -> Frozen 0.02 s, one frame 0.36 s)"). Send that line.

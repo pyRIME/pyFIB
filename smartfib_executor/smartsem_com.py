@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
@@ -41,6 +42,102 @@ class StagePosition:
     master_z_m: float
 
 
+# --------------------------------------------------------------------------------------
+# One SmartSEM client at a time (v0.53.3). Evan, 2026-10-12: Rough Mill Start crashed with
+# ZEISS "RRemoting Error: Failed to create an instance of Managed ... unable to open port
+# for incoming connections" and exit -1073741819 (access violation) while v0.39.0 worked.
+# Since v0.46.0 Start connected twice in a row (a tilt-check process, then the armed run
+# ~1 s later), and a hung python.exe titled "Remoting Forwarding Window" (the ZEISS API's
+# hidden window = a process holding a SmartSEM connection) was seen. Before creating the
+# API object, wait for any OTHER such process to go away; refuse cleanly if it does not.
+# --------------------------------------------------------------------------------------
+REMOTING_WINDOW_TITLE = "Remoting Forwarding Window"
+CLIENT_WAIT_S = 20.0
+
+
+def other_api_clients(*, _run=None, _is_windows=None, _self_pids=None, _parent_out=None):
+    """Other python.exe / pythonw.exe processes holding a SmartSEM connection (their window
+    is the ZEISS API's "Remoting Forwarding Window"): [{pid, image, status, title}].
+    Never this process or its parent (the pyFIB window that started it). [] off Windows
+    or if tasklist fails.
+
+    v0.55.1 (bug #18): ``_parent_out`` (a list) receives the PARENT's entry if the parent
+    itself holds a connection (the pyFIB window does once its GISDEP tab has connected).
+    It is still not returned as "other" -- it is only reported, so the Log shows when two
+    clients were connected at once."""
+    import csv
+    import os
+    import subprocess
+    if not (_is_windows if _is_windows is not None else os.name == "nt"):
+        return []
+    run = _run or subprocess.run
+    skip = set(_self_pids) if _self_pids is not None else {os.getpid(), os.getppid()}
+    parent_pid = os.getppid()
+    found = []
+    for image in ("python.exe", "pythonw.exe"):
+        try:
+            kw = {"creationflags": 0x08000000} if os.name == "nt" else {}   # no console flash
+            out = run(["tasklist", "/V", "/FO", "CSV", "/NH", "/FI", f"IMAGENAME eq {image}"],
+                      capture_output=True, text=True, timeout=15, **kw).stdout or ""
+        except Exception:  # noqa: BLE001
+            continue
+        for rec in csv.reader(out.splitlines()):
+            if len(rec) < 9:
+                continue                       # "INFO: No tasks are running ..."
+            try:
+                pid = int(rec[1])
+            except ValueError:
+                continue
+            if pid in skip:
+                if (_parent_out is not None and pid == parent_pid and pid != os.getpid()
+                        and REMOTING_WINDOW_TITLE.lower() in rec[8].lower()):
+                    _parent_out.append({"pid": pid, "image": rec[0], "status": rec[5],
+                                        "title": rec[8]})
+                continue
+            if REMOTING_WINDOW_TITLE.lower() in rec[8].lower():
+                found.append({"pid": pid, "image": rec[0], "status": rec[5],
+                              "title": rec[8]})
+    return found
+
+
+def wait_for_other_api_clients(wait_s: float = CLIENT_WAIT_S, *, poll_s: float = 1.0,
+                               log=print, _find=None, _sleep=time.sleep, _clock=time.monotonic):
+    """Return once no other process holds a SmartSEM connection; after ``wait_s`` raise
+    SmartSEMError naming them (nothing has been sent to the microscope)."""
+    find = _find or other_api_clients
+    t0 = _clock()
+    said = False
+    first = True
+    while True:
+        if first and _find is None:
+            # v0.55.1 (#18): note (never refuse) when the window that started this command
+            # holds a connection of its own -- two clients are then connected at once.
+            first = False
+            parent = []
+            others = find(_parent_out=parent)
+            for o in parent:
+                try:
+                    log(f"[connect] note: the pyFIB window (PID {o['pid']}) holds a SmartSEM "
+                        f"connection of its own (GISDEP tab); this command adds a second one.")
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            others = find()
+        if not others:
+            return
+        if _clock() - t0 >= float(wait_s):
+            desc = ", ".join(f"{o['image']} PID {o['pid']} ({o['status']})" for o in others)
+            raise SmartSEMError(
+                f"another program holds a SmartSEM connection: {desc}. It did not let go "
+                f"within {wait_s:g} s. End it in Task Manager (Details) and try again. "
+                f"Nothing was sent to the microscope.")
+        if not said:
+            log(f"[connect] waiting for another SmartSEM client to finish "
+                f"({', '.join(str(o['pid']) for o in others)}) ...")
+            said = True
+        _sleep(float(poll_s))
+
+
 class SmartSEM:
     """Thin wrapper over the SmartSEM CZEMApi ActiveX (COM) control.
 
@@ -50,7 +147,8 @@ class SmartSEM:
     - Get/Set use VARIANT types; helper methods here request explicit float/string types.
     """
 
-    def __init__(self, suppress_remoting_popups: bool = True):
+    def __init__(self, suppress_remoting_popups: bool = True,
+                 client_wait_s: float = CLIENT_WAIT_S):
         if _IMPORT_ERROR is not None:
             raise RuntimeError(
                 "pywin32/pythoncom not available. This package must run on Windows with pywin32 installed."
@@ -58,6 +156,11 @@ class SmartSEM:
 
         assert pythoncom is not None
         assert win32com is not None
+
+        # v0.53.3: never create a second SmartSEM client while another process holds one
+        # (the ZEISS API then crashes this process with an access violation).
+        if client_wait_s is not None and client_wait_s >= 0:
+            wait_for_other_api_clients(client_wait_s)
 
         # SmartSEM OCX expects STA.
         pythoncom.CoInitialize()
@@ -274,7 +377,23 @@ class SmartSEM:
         return StagePosition(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
 
     def move_stage(self, x_m: float, y_m: float, z_m: float, t_deg: float, r_deg: float, m_m: float) -> None:
-        """Move stage using MoveStage(x,y,z,t,r,m). Non-blocking."""
+        """Move stage using MoveStage(x,y,z,t,r,m). Non-blocking.
+
+        v0.55.1 (bug #20): refuses a non-finite number (NaN / infinity) before anything is
+        sent -- what MoveStage does with one is unknown, and the arrival check could not
+        tell (a comparison with NaN is never "off target")."""
+        vals = {"x_m": x_m, "y_m": y_m, "z_m": z_m, "t_deg": t_deg, "r_deg": r_deg, "m_m": m_m}
+        bad = []
+        for k, v in vals.items():
+            try:
+                if not math.isfinite(float(v)):
+                    bad.append(f"{k}={v!r}")
+            except (TypeError, ValueError):
+                bad.append(f"{k}={v!r}")
+        if bad:
+            raise SmartSEMError(
+                f"MoveStage refused: {', '.join(bad)} is not a finite number. Nothing was "
+                f"sent to the stage.")
         self._call_ok(self.api.MoveStage, float(x_m), float(y_m), float(z_m), float(t_deg), float(r_deg), float(m_m))
 
     # --- gisdep SmartSEMInterface surface (delegates to the methods above) -----
@@ -356,6 +475,13 @@ class SmartSEM:
         """
         targets = {"x_m": x_m, "y_m": y_m, "z_m": z_m,
                    "tilt_deg": t_deg, "rot_deg": r_deg, "master_z_m": m_m}
+        # v0.55.1 (#20): a NaN target used to count as "arrived" (abs(cur - nan) > tol is
+        # False). A non-finite target is refused; a non-finite read-back is "not arrived".
+        _bad = [f"{k}={tv!r}" for k, tv in targets.items()
+                if tv is not None and not math.isfinite(float(tv))]
+        if _bad:
+            raise SmartSEMError(
+                f"wait_stage_arrival: target {', '.join(_bad)} is not a finite number.")
         linear = {"x_m", "y_m", "z_m", "master_z_m"}
         t0 = time.time()
         last_miss = "?"
@@ -373,6 +499,9 @@ class SmartSEM:
                         continue
                     cur = float(getattr(pos, k))
                     tol = tol_m if k in linear else tol_deg
+                    if not math.isfinite(cur):
+                        miss = f"{k} reads {cur!r}"
+                        break
                     if abs(cur - float(tv)) > tol:
                         miss = f"{k} off by {abs(cur - float(tv)):.4g}"
                         break

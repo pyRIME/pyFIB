@@ -8,7 +8,7 @@ residual shrank (see refine.py). These defaults are the starting guess.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 # Magnification -> field-of-view calibration. Duplicated from the autofocus fork
 # on purpose: this module stays isolated until it is proven on the instrument.
@@ -149,3 +149,53 @@ def stage_correction(drift_x_m: float, drift_y_m: float, *, tilt_deg: float,
     rx = drift_x_m * math.cos(th) - drift_y_m * math.sin(th)
     ry = drift_x_m * math.sin(th) + drift_y_m * math.cos(th)
     return sign_x * rx / sx, sign_y * ry / sy
+
+
+# --- CLEM targeting (v0.52.0): image point -> stage move ------------------------- #
+class TargetGeometryError(ValueError):
+    """A target cannot be converted to a stage move (outside the measured model, scan
+    rotation or beam shift not zero, ...). Nothing should move."""
+
+
+TARGET_MAX_SCAN_ROTATION_DEG = 0.05   # Evan 2026-10-09: refuse a non-zero scan rotation
+TARGET_MAX_BEAM_SHIFT_M = 1.0e-8      # 0.01 um per axis: refuse a non-zero beam shift
+
+
+def target_stage_delta(target_px_x: float, target_px_y: float, *,
+                       image_width_px: int, image_height_px: int, pixel_size_m: float,
+                       tilt_deg: float, rot_deg: float,
+                       scan_rotation_deg: Optional[float] = 0.0,
+                       beam_shift_m: Tuple[Optional[float], Optional[float]] = (0.0, 0.0),
+                       ) -> Tuple[float, float]:
+    """Stage DELTA (dx_m, dy_m) that brings an image point to the image centre.
+
+    The point is in pixels, corner convention (pixel (0,0) spans [0,1); x right, y down;
+    the centre is (W/2, H/2)) -- the convention of elymaker's coords.py, pyMap and
+    report/map_export.py. Its offset from the centre times the image's pixel size is
+    treated as refine's "drift" (the feature sits that far from where it should be), so
+    `stage_correction` gives the move that centres it. Same measured signs and tilt
+    model as refine (calibration at tilt 30 deg, R 12: +20 um stage X -> +323.3 px,
+    +20 um stage Y -> -309.9 px at 2000x / 1024 px).
+
+    Refuses (TargetGeometryError) outside the model's tilt/rotation range, or when the
+    image was taken with a scan rotation or beam shift (the mapping would be rotated /
+    offset). `tilt_deg` / `rot_deg` are the stage tilt and rotation the IMAGE was
+    captured at; X/Y only -- Z/T/R/M are not part of the result.
+    """
+    ok, why = stage_model_applies(tilt_deg, rot_deg)
+    if not ok:
+        raise TargetGeometryError(f"stage model does not apply: {why}")
+    if scan_rotation_deg is None or abs(float(scan_rotation_deg)) > TARGET_MAX_SCAN_ROTATION_DEG:
+        raise TargetGeometryError(
+            f"image scan rotation {scan_rotation_deg!r} deg is not 0 "
+            f"(limit {TARGET_MAX_SCAN_ROTATION_DEG:g} deg)")
+    for axis, v in zip("XY", beam_shift_m):
+        if v is None or abs(float(v)) > TARGET_MAX_BEAM_SHIFT_M:
+            raise TargetGeometryError(
+                f"image beam shift {axis} = {v!r} m is not 0 "
+                f"(limit {TARGET_MAX_BEAM_SHIFT_M * 1e6:g} um)")
+    if not (pixel_size_m and pixel_size_m > 0):
+        raise TargetGeometryError(f"pixel size {pixel_size_m!r} is not usable")
+    off_x = (float(target_px_x) - image_width_px / 2.0) * float(pixel_size_m)
+    off_y = (float(target_px_y) - image_height_px / 2.0) * float(pixel_size_m)
+    return stage_correction(off_x, off_y, tilt_deg=float(tilt_deg))

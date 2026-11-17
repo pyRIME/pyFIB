@@ -1,4 +1,4 @@
-MILLING STAGES: ROUGH MILL -> PREPOLISH -> POLISH (pyFIB v0.51.0)      about 20 min
+MILLING STAGES: ROUGH MILL -> PREPOLISH -> POLISH (pyFIB v0.51.0; steps 7-8 v0.52.2/v0.53.1)  about 20 min
 ==============================================================================
 
 What changed
@@ -70,3 +70,26 @@ moves when it should not.
 Optional later (needs the prepolish .ely): one sacrificial site, Prepolish tab, ARM ON,
 Start with that site only -> it refines to its rough after image, mills the prepolish
 pattern, and saves <pos>_2-prepolish_<time>.bmp. Polish tab then shows it in "Align to".
+
+
+7) CONFIRM DONE WINDOW (v0.52.2), on your next real Rough Mill batch      no extra time
+   The milling tabs have "Confirm done (s)" next to Wait, default 20 (was always 30).
+   Nothing to set up: mill as usual and watch the Log after each site.
+   Expect: "[confirm] Potential completion detected; confirming for 20s..." then
+   "[confirm] Completion confirmed." about 20 s later, then the after image.
+   If you ever see "[confirm] Completion not stable after N s (window 20 s)", send that
+   line with the pattern name: N is how long SmartSEM falsely read "finished" (e.g. at a
+   probe change between pattern parts). The window must stay well above the largest N.
+
+
+8) AFTER IMAGE AFTER SMARTFIB'S RESET (v0.53.1), on your next real batch   no extra time
+   SmartFIB often switches to SEM imaging and a very low FIB magnification when a mill
+   ends. The after image now logs what SmartFIB left, then sets FIB imaging, 2000x and the
+   objective used for milling, reads both back, and only then grabs.
+   Expect after each site, in the Log:
+     [after-image] SmartFIB left: imaging 'SEM', FIB mag ..x, objective .... V; probe: ...
+     [after-image] FIB 2000x (read back 2000x), objective .... V (read back .... V)
+   If you see "skipped: FIB magnification reads ..." or "skipped: objective reads ...",
+   send those lines. PLEASE SEND the "SmartFIB left" lines from one batch either way:
+   they show what SmartFIB changes, the objective read-back precision, and which FIB
+   probe-current readings answer on this instrument (needed for probe control later).

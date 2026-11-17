@@ -196,6 +196,15 @@ def test_mill_argv_assembly_from_checkboxes():
     assert argv[argv.index("--autofocus") + 1] == "s1"
     assert argv[argv.index("--refine") + 1] == "s3"
     assert argv[argv.index("--move-method") + 1] == "movestage"   # v0.38.0 default
+    assert argv[argv.index("--done-confirm-s") + 1] == "20"       # v0.52.2 UI default
+    for page in (win.prepolish_page, win.polish_page):              # same box on every tab
+        assert page.done_confirm_spin.value() == 20
+    mp.done_confirm_spin.setValue(3)                                # floor 10 s
+    assert mp.done_confirm_spin.value() == 10
+    mp.done_confirm_spin.setValue(25)
+    assert mp.build_argv()[mp.build_argv().index("--done-confirm-s") + 1] == "25"
+    from ...cli import build_parser                                 # the CLI accepts it
+    assert build_parser().parse_args(argv).done_confirm_s == 20.0
     assert "--arm" not in argv
     win.arm_bar.arm_btn.setChecked(True)
     assert "--arm" in mp.build_argv()
@@ -332,10 +341,12 @@ def test_gisdep_tab_embeds_the_real_window():
         return
     _app()
     from ..app import MainWindow, NAV
-    # gisdep tab sits between Setup and Capture; elymaker right after gisdep
+    # gisdep tab sits between Setup and Capture; v0.52.0: Correlation right after gisdep
+    # (both at SEM normal), then elymaker
     keys = [k for k, _ in NAV]
     assert keys.index("gisdep") == keys.index("setup") + 1
-    assert keys.index("elymaker") == keys.index("gisdep") + 1
+    assert keys.index("correlation") == keys.index("gisdep") + 1
+    assert keys.index("elymaker") == keys.index("correlation") + 1
     assert keys.index("elymaker") < keys.index("capture")
     win = MainWindow()
     win.show_page("gisdep")                       # builds lazily (mock offline)
@@ -509,11 +520,13 @@ def test_mill_tab_refine_stage_checkboxes():
     win.close()
 
 
-def test_mill_armed_start_checks_tilt_first_and_asks_before_skipping():
-    """v0.46.0: armed Start -> read-only --tilt-check -> OK for the skips -> armed run with
-    --accept-tilt-skips. Not armed: straight to the dry run, as before."""
+def test_mill_armed_start_connects_once_and_asks_only_when_positions_are_skipped():
+    """v0.53.3 (was v0.46.0's separate --tilt-check first): armed Start runs the armed
+    batch directly -- ONE SmartSEM connection. The batch checks the tilt limit itself
+    before any motion; if it refuses (exit 3, TILT-CHECK line) the operator is asked and
+    only then is it started again with --accept-tilt-skips."""
     if not HAVE_QT:
-        print("SKIP test_mill_armed_start_checks_tilt_first_and_asks_before_skipping")
+        print("SKIP test_mill_armed_start_connects_once_and_asks_only_when_positions_are_skipped")
         return
     import tempfile
     from pathlib import Path
@@ -535,14 +548,22 @@ def test_mill_armed_start_checks_tilt_first_and_asks_before_skipping():
     mp._on_start()                                     # not armed: dry run only
     assert len(calls) == 1 and "--arm" not in calls[0][0] and "--tilt-check" not in calls[0][0]
     _set_armed(win, True)
-    for ans, want in ((True, "run"), (False, "none")):
+    calls.clear()                                      # all within the limit: one run
+    mp._on_start()
+    a, k = calls[0]
+    assert "--arm" in a and "--tilt-check" not in a, a
+    k["on_line"]("TILT-CHECK: live=1.9700 limit=2 allowed=s1,s2,s3 excluded=")
+    k["on_done"](0)
+    assert len(calls) == 1 and confirms == []
+    for ans, want in ((True, "run"), (False, "none")):  # s2 out of range: batch refuses
         calls.clear(); confirms.clear(); answer[0] = ans
         mp._on_start()
         a, k = calls[0]
-        assert "--tilt-check" in a and "--arm" not in a, a      # the check never arms
-        k["on_line"]("[tilt] current stage tilt 1.97 deg")
+        assert "--arm" in a and "--accept-tilt-skips" not in a
         k["on_line"]("TILT-CHECK: live=1.9700 limit=2 allowed=s1,s3 excluded=s2")
-        k["on_done"](0)
+        k["on_line"]("[tilt] Refusing: s2 would not be milled and that was not OKed. "
+                     "Nothing moved.")
+        k["on_done"](3)
         assert len(confirms) == 1 and "s2" in confirms[0] and "NOT be milled" in confirms[0]
         if want == "run":
             a2 = calls[1][0]
@@ -550,12 +571,13 @@ def test_mill_armed_start_checks_tilt_first_and_asks_before_skipping():
             assert mp.table.item(mp._row_by_name["s2"], mp.C_STATUS).text() == "Skipped (tilt)"
         else:
             assert len(calls) == 1                     # declined: nothing else runs
-    calls.clear(); confirms.clear()                    # nothing excluded: no question
+    calls.clear(); confirms.clear()                    # nothing within the limit: no question
     mp._on_start(); k = calls[0][1]
-    k["on_line"]("TILT-CHECK: live=1.9700 limit=2 allowed=s1,s2,s3 excluded=")
-    k["on_done"](0)
-    assert confirms == [] and "--arm" in calls[1][0] and "--accept-tilt-skips" not in calls[1][0]
-    calls.clear()                                      # check failed (rc 2): nothing runs
+    k["on_line"]("TILT-CHECK: live=30.0000 limit=2 allowed= excluded=s1,s2,s3")
+    k["on_line"]("[tilt] No position is within the tilt limit; nothing to mill. Nothing moved.")
+    k["on_done"](3)
+    assert len(calls) == 1 and confirms == []
+    calls.clear()                                      # any other failure: nothing re-runs
     mp._on_start(); calls[0][1]["on_done"](2)
     assert len(calls) == 1
     win.close()
@@ -825,8 +847,8 @@ def test_stage_tabs_pattern_reference_columns_and_skip_ok():
             assert calls == []                                          # declined: nothing runs
         else:
             a = calls[0][0]
-            assert "--tilt-check" in a and "--arm" not in a and \
-                a[a.index("--accept-reference-skips") + 1] == "s2"
+            assert "--tilt-check" not in a and "--arm" in a and \
+                a[a.index("--accept-reference-skips") + 1] == "s2"     # v0.53.3: one run
             assert pre.table.item(r2, pre.C_STATUS).text().startswith("Skipped")
     # review: a failed refine never mills in Prepolish/Polish (locked on); an unrefined
     # site needs its own OK when armed
@@ -903,6 +925,257 @@ def test_manual_buttons_build_site_commands_and_confirm_when_armed():
     win.show_page("polish")
     assert pol.table.item(pol._row_by_name["s1"], pol.C_REF).text() == "prepolish 10-07 12:12"
     win.close()
+
+
+def test_correlation_mark_targets_card():
+    """v0.53.0: tick targets -> one markup layout on the overview; Mill markup is a dry
+    run unarmed, confirmed + --arm armed; Edit opens it in ELYMaker; an edit is kept and
+    locks the ticks until Reset."""
+    if not HAVE_QT:
+        print("SKIP test_correlation_mark_targets_card (Qt not installed)")
+        return
+    from pathlib import Path
+    from qtpy.QtCore import Qt
+    from ...tests.test_clem import _session
+    _app()
+    from ..app import MainWindow
+    d, clem, tp = _session()                  # T1 OK; T2 warning, near the field edge
+    win = MainWindow(); win.arm_bar.pos_edit.setText(str(d / "positions.json"))
+    calls, confirms, answer, handoffs, shown = [], [], [True], [], []
+    win.run_cli = lambda a, **k: calls.append((list(a), k)) or True
+    win.confirm = lambda m: confirms.append(m) or answer[0]
+    win.show_page("correlation")
+    cp = win.correlation_page
+    win.elymaker_page.open_handoff = lambda **k: handoffs.append(k)
+    real_show = win.show_page
+    win.show_page = lambda key: shown.append(key)
+    mk = lambda r: cp.table.item(r, cp.T_MARK).checkState() == Qt.Checked
+    assert mk(0) and not mk(1)                                # OK ticked, warning not
+    assert cp.table.item(0, cp.T_MARKUP).text() == "will mark"
+    assert "1 markup(s) on clem_ov_grid1_1 at 400x" in cp.markup_status.text()
+    assert "30kV:1.5nA" in cp.markup_status.text()
+    cp.table.item(1, cp.T_MARK).setCheckState(Qt.Checked)    # T2 is too near the edge
+    assert cp.table.item(1, cp.T_MARKUP).text().startswith("refused:")
+    cp._on_mill_markup()                                      # unarmed: dry run, no question
+    a, k = calls[-1]
+    assert a[0] == "clem-markup" and "--arm" not in a and confirms == []
+    assert a[a.index("--targets") + 1] == "T1,T2" and a[a.index("--done-confirm-s") + 1] == "20"
+    _set_armed(win, True)
+    answer[0] = False
+    cp._on_mill_markup()
+    assert len(calls) == 1 and "on 1 target(s) (1) at 400x" in confirms[-1]
+    answer[0] = True
+    cp._on_mill_markup()
+    assert "--arm" in calls[-1][0] and "stage stays at clem_ov_grid1_1" in confirms[-1]
+    cp._on_check_markup()                                     # Check is always a dry run
+    assert "--arm" not in calls[-1][0]
+    f = clem / "markup" / "clem_ov_grid1_1_markup.ely"
+    assert f.exists()
+    cp._on_edit_markup()
+    h = handoffs[-1]
+    assert shown[-1] == "elymaker" and h["out_path"] == str(f) and h["load_path"] == str(f)
+    assert abs(h["pixel_size_um"] - 0.2790527) < 1e-6 and abs(h["fov_width_um"] - 285.75) < 0.01
+    # The operator saves an edit in ELYMaker.
+    f.write_text(f.read_text() + "\n")                        # any saved change
+    cp.refresh_markup()
+    assert "edited in ELYMaker" in cp.markup_status.text()
+    assert cp.table.item(0, cp.T_MARKUP).text() == "in edited layout"
+    assert not (cp.table.item(0, cp.T_MARK).flags() & Qt.ItemIsEnabled)
+    cp._on_reset_markup()                                     # confirmed: regenerated
+    assert "edited" not in cp.markup_status.text() and confirms[-1].startswith("Discard")
+    assert cp.table.item(0, cp.T_MARK).flags() & Qt.ItemIsEnabled
+    win.show_page = real_show
+    win.close()
+
+
+def test_correlation_tab_targets_overviews_and_pymap_pane():
+    """v0.52.0: Correlation tab after GISDEP. Targets pane shows pyMap's checked targets;
+    overview / go-to-grid / coincidence buttons build the right commands (dry run unarmed,
+    confirmed when armed); the Register pane embeds pyMap via pymap.gui.embed, or says
+    it is missing."""
+    if not HAVE_QT:
+        print("SKIP test_correlation_tab_targets_overviews_and_pymap_pane (Qt not installed)")
+        return
+    import sys, tempfile, textwrap
+    from pathlib import Path
+    from ...tests.test_clem import _session
+    _app()
+    from ..app import MainWindow, NAV
+    from .. import correlation_page as CP
+    keys = [k for k, _ in NAV]
+    assert keys.index("correlation") == keys.index("gisdep") + 1
+    d, clem, tp = _session()
+    win = MainWindow(); win.arm_bar.pos_edit.setText(str(d / "positions.json"))
+    calls, mods, confirms, answer = [], [], [], [True]
+    win.run_cli = lambda a, **k: calls.append((list(a), k)) or True
+    win.run_module = lambda m, a, **k: mods.append((m, list(a), k)) or True
+    win.confirm = lambda m: confirms.append(m) or answer[0]
+    win.show_page("correlation")
+    cp = win.correlation_page
+    assert win.stack.currentWidget() is cp
+    assert cp.table.rowCount() == 2
+    assert [cp.table.item(r, cp.T_STATUS).text() for r in range(2)] == ["OK", "Warning"]
+    assert cp.table.item(0, cp.T_DX).text() == "-19.8"
+    assert "UNVERIFIED" in cp.summary.text() and "clem_ov_grid1_1" in cp.ov_label.text()
+    # unarmed: dry runs, no questions
+    cp._on_capture("fib")
+    a, k = calls[-1]
+    assert a[:5] == ["clem-overview", "--kind", "fib", "--grid", "Grid1"] and "--arm" not in a
+    assert a[a.index("--mag") + 1] == "400" and k["show_log"] is False and confirms == []
+    cp._on_coincidence()
+    assert mods[-1][0] == "smartfib_executor.coincidence" and mods[-1][1] == ["--dry-run", "--simulate"]
+    _set_armed(win, True)
+    cp.grid_combo.setCurrentText("Grid2")
+    answer[0] = False
+    cp._on_goto_grid(); cp._on_capture("sem")
+    assert len(confirms) == 2 and len(mods) == 1 and len(calls) == 1      # declined: nothing
+    answer[0] = True
+    cp._on_goto_grid()
+    assert mods[-1][0] == "smartfib_executor.setup_move" and mods[-1][1] == ["Grid2 GIS Normal", "--arm"]
+    cp.sem_mag.setValue(150)
+    cp._on_capture("sem")
+    a = calls[-1][0]
+    assert "--arm" in a and a[a.index("--mag") + 1] == "150" and "SEM overview" in confirms[-1]
+    cp._on_coincidence()
+    assert mods[-1][1] == ["--dry-run"]                                    # armed: real, no Z move
+    cp._on_check()
+    assert calls[-1][0][:2] == ["clem-targets", str(tp)]
+    cp.accept_qc.setChecked(True); cp._on_check()
+    assert "--accept-qc" in calls[-1][0]
+    # Register pane: missing pyMap -> a note; the bundled pyMap (v0.52.1) -> embedded
+    root, has_embed = CP.find_pymap()
+    if root is None:
+        assert "not installed" in cp.register.note.text()
+    else:
+        try:
+            import skimage  # noqa: F401
+            have_sk = True
+        except Exception:  # noqa: BLE001
+            have_sk = False
+        if has_embed and have_sk:
+            from qtpy.QtWidgets import QApplication
+            w = cp.register._widget
+            assert w is not None and type(w).__module__.startswith("pymap.gui"), w
+            assert cp.register._built_for == str(d)
+            sheet = QApplication.instance().styleSheet()
+            cp.register.ensure_built(d)                         # same session: kept
+            assert cp.register._widget is w and QApplication.instance().styleSheet() == sheet
+    pkg = Path(tempfile.mkdtemp())
+    (pkg / "pymap" / "gui").mkdir(parents=True)
+    (pkg / "pymap" / "__init__.py").write_text("")
+    (pkg / "pymap" / "gui" / "__init__.py").write_text("")
+    (pkg / "pymap" / "gui" / "embed.py").write_text(textwrap.dedent("""
+        from qtpy.QtWidgets import QLabel
+        SEEN = {}
+        def build_widget(parent=None, *, session_dir=None, positions_file=None,
+                         on_targets_written=None):
+            SEEN.update(session_dir=session_dir, positions_file=positions_file,
+                        cb=on_targets_written)
+            return QLabel("pyMap here", parent)
+    """))
+    sys.path.insert(0, str(pkg))
+    # Keep the real pymap modules and put them back afterwards: the bundled pymap_tests
+    # hold class objects (e.g. ConfocalImportError) from the real import, and a fresh
+    # re-import after this test would make their pytest.raises checks miss.
+    real_pymap = {m: mod for m, mod in sys.modules.items()
+                  if m == "pymap" or m.startswith("pymap.")}
+    try:
+        for m in real_pymap:
+            del sys.modules[m]
+        pane = CP.RegisterPane(cp)
+        pane.ensure_built(d, str(d / "positions.json"))
+        import pymap.gui.embed as emb
+        assert pane._widget is not None and pane._widget.text() == "pyMap here"
+        assert emb.SEEN["session_dir"] == str(d)
+        assert emb.SEEN["positions_file"] == str(d / "clem" / "overview_positions.json")
+        cp.table.setRowCount(0); emb.SEEN["cb"](str(tp))                   # pyMap wrote targets
+        assert cp.table.rowCount() == 2
+        first = pane._widget
+        d2 = Path(tempfile.mkdtemp())                                      # new session
+        pane.ensure_built(d2)
+        assert pane._widget is not first and emb.SEEN["session_dir"] == str(d2)
+    finally:
+        sys.path.remove(str(pkg))
+        for m in [m for m in sys.modules if m == "pymap" or m.startswith("pymap.")]:
+            del sys.modules[m]
+        sys.modules.update(real_pymap)
+    win.close()
+
+
+def test_logo_files_are_complete_and_sized():
+    # v0.54.1: pure file check -- always runs, even without Qt.
+    from PIL import Image
+    from ..branding import ICON_SIZES, LOGO_DIR, NAV_LOCKUP
+    for n in ICON_SIZES:
+        with Image.open(LOGO_DIR / f"pyfib_mark_{n}.png") as im:
+            assert im.size == (n, n) and im.mode == "RGBA", n
+    with Image.open(LOGO_DIR / "pyfib.ico") as ico:
+        assert {(16, 16), (32, 32), (48, 48), (256, 256)} <= set(ico.ico.sizes())
+    for name in ("pyfib_mark.svg", "pyfib_logo_on_dark.svg", "pyfib_logo_on_light.svg",
+                 NAV_LOCKUP, "README.md"):
+        assert (LOGO_DIR / name).exists(), name
+    # outlines only: the SVGs must not depend on installed fonts
+    for svg in LOGO_DIR.glob("*.svg"):
+        assert "<text" not in svg.read_text(encoding="utf-8"), svg.name
+
+
+def test_window_shows_the_logo_icon_and_nav_lockup():
+    if not HAVE_QT:
+        print("SKIP test_window_shows_the_logo_icon_and_nav_lockup (Qt not installed)")
+        return
+    _app()
+    from ..app import MainWindow
+    win = MainWindow()
+    icon = win.windowIcon()
+    assert not icon.isNull()
+    sizes = {(s.width(), s.height()) for s in icon.availableSizes()}
+    assert {(16, 16), (32, 32), (256, 256)} <= sizes, sizes
+    pm = win.brand.pixmap()
+    assert pm is not None and not pm.isNull()
+    assert win.brand.accessibleName() == "pyFIB" and "pyFIB v" in win.brand.toolTip()
+    win.close()
+
+
+def test_logo_top_left_and_arm_button_bottom_of_nav():
+    # v0.54.2 (Evan, 2026-10-18): logo where ARM was; ARM at the bottom left.
+    if not HAVE_QT:
+        print("SKIP test_logo_top_left_and_arm_button_bottom_of_nav (Qt not installed)")
+        return
+    _app()
+    from qtpy.QtWidgets import QVBoxLayout, QWidget
+    from ..app import MainWindow
+    win = MainWindow()
+    bar_lay = win.arm_bar.layout()
+    assert bar_lay.indexOf(win.brand) == 0                      # first in the top bar
+    assert bar_lay.indexOf(win.arm_bar.arm_btn) == -1           # ARM is not in it
+    nav = win.findChild(QWidget, "navBar")
+    nav_lay = nav.layout()
+    assert isinstance(nav_lay, QVBoxLayout)
+    i_arm = nav_lay.indexOf(win.arm_bar.arm_btn)
+    assert i_arm == nav_lay.count() - 1                         # last item: bottom left
+    assert all(nav_lay.indexOf(b) < i_arm for b in win._nav_buttons.values())
+    # same wiring: toggling arms the window and relabels the button (two lines)
+    assert not win.is_armed() and win.arm_bar.arm_btn.text() == "ARM\n(dry-run)"
+    win.arm_bar.arm_btn.setChecked(True)
+    assert win.is_armed() and win.arm_bar.arm_btn.text() == "ARMED\n(instrument live)"
+    win.arm_bar.arm_btn.setChecked(False)
+    assert not win.is_armed()
+    win.close()
+
+
+def test_nav_brand_falls_back_to_text_without_the_image():
+    if not HAVE_QT:
+        print("SKIP test_nav_brand_falls_back_to_text_without_the_image (Qt not installed)")
+        return
+    _app()
+    from .. import branding
+    old = branding.NAV_LOCKUP
+    branding.NAV_LOCKUP = "missing.png"
+    try:
+        lbl = branding.brand_label("pyFIB")
+        assert lbl.text() == "pyFIB"
+    finally:
+        branding.NAV_LOCKUP = old
 
 
 def _run_all() -> int:

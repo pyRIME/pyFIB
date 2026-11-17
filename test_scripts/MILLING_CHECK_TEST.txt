@@ -1,0 +1,49 @@
+MILLING CHECK + 3 s WAIT FOR THE MANUAL BUTTONS (pyFIB v0.53.5)          about 10 min
+==============================================================================
+Why: after a SmartFIB snapshot, Patterning Mode reads FIB and the manual buttons refused
+"SmartSEM indicates milling" (bug #15). For the manual buttons FIB now counts as not
+milling; FIB + SEM, a value never seen before, or an unreadable flag still counts as
+milling. Batches stay strict (pyFIB itself writes Patterning Mode = FIB when it starts a
+mill). The manual buttons (Go to, Align, Push pattern, Record after image) now watch for
+3 s instead of 10 s / 5 s.
+
+Steps 1-3 only READ (milling-check sends nothing). Do them during a normal manual
+Prepolish or Polish at a site you are working on anyway. Never press a pyFIB button while
+a mill is running.
+
+1) DURING A MILL you started in SmartFIB, in a terminal:
+     python -m smartfib_executor.cli milling-check
+   Expect both verdict lines to say MILLING, e.g.
+     "MILLING: the manual buttons would refuse -- DP_FIB_MODE = 2 'Milling'"
+   (the three flag lines above them should read Milling / Mill + SEM / FIB + SEM).
+   If it says NOT MILLING here: STOP, do not use the manual buttons, send the output.
+
+2) AFTER THE PATTERN FINISHES (before any snapshot):
+     python -m smartfib_executor.cli milling-check
+   Expect both lines NOT MILLING (DP_FIB_MODE = 0 'Imaging', DP_FIB_IMAGING = 0 'SEM',
+   DP_PATTERNING_MODE = 0 'Off').
+
+3) TAKE A SmartFIB SNAPSHOT, then:
+     python -m smartfib_executor.cli milling-check
+   Expect: "NOT MILLING: the manual buttons would proceed ..." and
+           "MILLING: a batch would wait before its next stage move -- DP_PATTERNING_MODE = 2 'FIB'"
+   (by design: reset with SEM on/off before starting a batch).
+
+4) Still after the snapshot (no SEM on/off workaround), press Record after image in the
+   tab you are working in (Prepolish or Polish).
+   Expect in the Log: "[site] checking that SmartSEM is not milling (3 s) ..." and the
+   after image is recorded (no refusal).
+
+5) Go to the next site with Go to, then Align, as usual.
+   Expect each to show "(3 s)" and to start about 3 s after the click (was 10 s).
+
+6) NEXT BATCH (information only, no extra action): while a site is milling, the Log prints
+   "[wait] ... DP_FIB_MODE=.. | DP_FIB_IMAGING=.. | DP_PATTERNING_MODE=.. | ..." lines.
+   Send one from the middle of a mill. It shows what Patterning Mode reads during a mill
+   pyFIB started (it writes 'FIB' after the start) -- that decides whether batches can
+   later relax like the buttons. (milling-check can't run during a batch: the batch holds
+   the SmartSEM connection.)
+
+If any button still refuses, the message now names the flag, e.g.
+  "... refused: SmartSEM indicates milling (DP_PATTERNING_MODE = 3 'FIB + SEM') ..."
+Send that line and the milling-check output from the same moment.

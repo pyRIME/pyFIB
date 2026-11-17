@@ -1,0 +1,48 @@
+BEAM SHIFT IS NEVER RESET DURING A MILL (pyFIB v0.55.1, bug #16)            about 25 min
+==============================================================================
+Why: before v0.55.1 a batch reset the FIB beam shift after every site whatever SmartSEM
+read -- also after a mill timeout, and when the pyFIB window died during a mill. A
+beam-shift change in the middle of a pattern moves where the rest of it lands. Now the
+batch checks the milling state first. Not known: whether SmartSEM applies a beam-shift
+write during a pattern at all; step 4 measures that.
+
+Use ONE sacrificial position and a pattern that mills for 3-5 minutes. Rough Mill tab,
+Refine ticked (so a beam-shift correction is in use), After-mill image on.
+
+1) MILL TIMEOUT BOX                                                         1 min
+   Rough Mill, Prepolish and Polish tabs each show "Mill timeout (min)", default 240.
+   ARM OFF, Start: the plan in the Log has "Mill timeout: 240 min per site".
+
+2) A SITE THAT TIMES OUT                                                    8 min
+   Command prompt in the pyFIB folder (the tabs do not allow under 10 min):
+       python -m pyfib mill-positions <pattern.ely> <position> --positions-file <session>\positions.json --stage rough --refine <position> --wait auto --timeout 90 --arm
+   Watch SmartSEM's FIB beam shift X/Y (Status window) from the start.
+   Expect after 90 s: "Timeout waiting for milling to finish", then
+       "*** The pattern at <position> may still be running in SmartFIB ..."
+       "[beam-shift] checking for 30 s that milling has stopped ..."
+       "[beam-shift] *** NOT reset after <position>: SmartSEM indicates milling (...)"
+   and the pattern keeps milling to its end with the beam shift UNCHANGED.
+   Afterwards press Go to for that position: the beam shift reads 0.
+   Send: those Log lines and the beam shift before / during / after.
+
+3) THE WINDOW DIES DURING A MILL                                            8 min
+   Start the same site from the Rough Mill tab (ARM on). While it mills, end the pyFIB
+   WINDOW in Task Manager (the python.exe whose window is pyFIB; not the one with the
+   higher PID that runs the batch).
+   Expect: the pattern mills to its end; the beam shift is reset only after milling has
+   stopped; the after image is saved. Start pyFIB again: it reports the last run ended
+   without closing. <session>\runs\run_<time>.log ends with the site finished (with two
+   positions ticked: "Batch stopped: the pyFIB window that started this batch is gone ...
+   stopped before <position 2>").
+   (If the window is ended while a site is still at recall / autofocus / refine, that
+   site's mill is not started: "stopped at <position> before its mill was started".)
+   Send: the last 30 lines of that run_<time>.log.
+
+4) OPTIONAL, MEASURES THE UNKNOWN: DOES SMARTSEM TAKE A BEAM SHIFT DURING A MILL?  5 min
+   Sacrificial area only. Start a 3-5 min pattern by hand in SmartFIB. While it mills,
+   change FIB beam shift X by 1 um in SmartSEM. Does the pattern jump, is the change
+   refused, or does it apply after the pattern? Send what you saw.
+
+5) ORDINARY BATCH                                                           3 min
+   Two positions, everything default. Expect per site, as before:
+   "[n/2] FIB beam shift X/Y reset to 0 after <position>." and no "NOT reset" line.

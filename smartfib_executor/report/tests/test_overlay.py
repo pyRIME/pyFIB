@@ -71,6 +71,32 @@ def test_rect_rotation_matches_elymaker_rectitem():
                 (x, y, w, h, a, qt, mine)
 
 
+def _pts_close(a, b, tol=1e-9):
+    return len(a) == len(b) and all(_close(p, q, tol) for pa, pb in zip(a, b)
+                                    for p, q in zip(pa, pb))
+
+
+def test_rotated_rect_is_drawn_where_smartfib_places_it():
+    """v0.54.3 (bug #17), MEASURED in SmartFIB 2026-10-20: a RECT turns COUNTER-
+    CLOCKWISE about its box CENTRE. pyFIB_rotation_test.ely test A (anchor (-19, -1),
+    12 x 2 um, height +2, 30 deg) rises to the right through its centre (-13, 0); the
+    waffle's 270 deg hinge slots were milled at x -9.49..-7.49 um. Same rule as the
+    bundled elymaker's geometry.rect_corners."""
+    c = rect_corners_layout(-19.0, -1.0, 12.0, 2.0, 30.0)
+    want = [(-17.696152, -3.866025), (-7.303848, 2.133975),
+            (-8.303848, 3.866025), (-18.696152, -2.133975)]
+    assert _pts_close(c, want, 1e-5), c
+    hinge = rect_corners_layout(-8.59235, -1.35432, 0.2, 2.0, 270.0)
+    xs = [p[0] for p in hinge]; ys = [p[1] for p in hinge]
+    assert abs(min(xs) + 9.49) < 0.01 and abs(max(xs) + 7.49) < 0.01
+    assert abs(min(ys) + 0.45) < 0.01 and abs(max(ys) + 0.25) < 0.01
+    from elymaker.geometry import rect_corners
+    for case in [(-4.1, 0.47, 9.25, -0.27, 0.0), (2.0, -3.0, 5.0, -1.5, 30.0),
+                 (0.5, 0.5, 3.0, 2.0, 90.0), (3.0, 1.0, -2.0, -1.0, -45.0),
+                 (-8.58065, -0.514323, 0.2, 2.0, 270.0)]:
+        assert _pts_close(rect_corners_layout(*case), rect_corners(*case)), case
+
+
 def test_polygon_and_text_and_depth():
     from elymaker.model import Layout, Structure, LayerReference, Polygon, Text, Exposure, Probe
     lr = LayerReference(shapes=[

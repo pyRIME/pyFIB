@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from typing import List
 
+from .geometry import rect_corners
 from .model import Arc, Layout, Polygon, Rect, Shape, Text, DOSE_TO_METRE
 
 _Z_TOL = 1e-12   # metres; tolerance on z_extent == dose_factor*1e-6
@@ -26,12 +27,15 @@ def _shape_label(idx: int, sh: Shape) -> str:
 def _extent(sh: Shape):
     """Return (xmin, xmax, ymin, ymax) in um, or None if not applicable.
 
-    Rect extent ignores rotation (axis-aligned bound about its anchor); good
-    enough for a coarse field-of-view check.
+    Rect: the corners as SmartFIB places them (anchor box rotated about its centre;
+    pyFIB patch 0.9.1+pyfib.1 -- this used to treat (x, y) as the centre and ignore
+    the angle).
     """
     if isinstance(sh, Rect):
-        hw, hh = abs(sh.width) / 2.0, abs(sh.height) / 2.0
-        return (sh.x - hw, sh.x + hw, sh.y - hh, sh.y + hh)
+        pts = rect_corners(sh.x, sh.y, sh.width, sh.height, sh.angle_deg)
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (min(xs), max(xs), min(ys), max(ys))
     if isinstance(sh, Polygon):
         if not sh.points:
             return None

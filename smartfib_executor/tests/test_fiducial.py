@@ -71,10 +71,13 @@ def test_capture_records_fiducial_side():
     from ..positions import capture_position
 
     class _Sem:
-        def set_value(self, m, v): pass
+        mag = 52.0                          # v0.53.4: magnification is read back
+        def set_value(self, m, v):
+            if m == "AP_FIB_MAGNIFICATION": self.mag = float(v)
         def execute(self, c): pass
         def get_str(self, m): return ""
         def get_float(self, m):
+            if m == "AP_FIB_MAGNIFICATION": return self.mag
             return {"AP_FIB_OBJECTIVE_POTENTIAL": 16400.0, "AP_HEIGHT": 4.286e-5}.get(m, 0.0)
         def grab_bmp(self, path, **k): Path(path).write_bytes(b"BM")
     d = tempfile.mkdtemp()
@@ -134,10 +137,17 @@ def test_capture_records_fiducial_number_and_tilt_by_default():
     from ..positions import capture_position, PositionDatabase
 
     class _Sem:
-        def set_value(self, m, v): pass
-        def execute(self, c): pass
-        def get_str(self, m): return "Frozen" if m == "DP_FROZEN" else ""
+        mag = 52.0                          # v0.53.4: magnification is read back
+        def set_value(self, m, v):
+            if m == "AP_FIB_MAGNIFICATION": self.mag = float(v)
+        live = False                        # v0.53.4: the scan must go Live on unfreeze
+        def execute(self, c):
+            if c == "CMD_UNFREEZE_ZONE": self.live = True
+            if c in ("CMD_FREEZE_ZONE", "CMD_FREEZE_ALL"): self.live = False
+        def get_str(self, m):
+            return ("Live" if self.live else "Frozen") if m == "DP_FROZEN" else ""
         def get_float(self, m):
+            if m == "AP_FIB_MAGNIFICATION": return self.mag
             return {"AP_FIB_OBJECTIVE_POTENTIAL": 16400.0, "AP_HEIGHT": 4.286e-5,
                     "AP_STAGE_AT_T": 12.04}.get(m, 0.0)
         def grab_bmp(self, path, **k): Path(path).write_bytes(b"BM")

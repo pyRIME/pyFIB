@@ -1,0 +1,21 @@
+# pyMap (bundled at the pyFIB root as pymap/, v0.9.2) -- needed only for the
+# Correlation tab's Register pane. Instrument PC: Python 3.9.13, Windows.
+#   python -m pip install -r requirements-pymap.txt
+# Copied from pyMap v0.9.0's requirements-core.txt + requirements.txt; pyMap v0.9.2
+# (pyFIB v0.55.0) needs nothing new.
+#
+# numpy / scikit-image pinned EXACTLY (scikit-image 0.22.0 is the last line for
+# Python 3.9 with the estimators pyMap uses; numpy 1.26.4 matches its ABI).
+numpy==1.26.4
+scikit-image==0.22.0
+pillow>=10.4,<12
+qtpy>=2.4,<3
+PyQt5>=5.15,<5.16
+# Optional confocal formats: OME-TIFF / ImageJ hyperstacks (tifffile), Leica .lif (readlif).
+tifffile>=2023.7.10,<2025
+# v0.53.2 (pyFIB): tifffile cannot decode LZW / JPEG / other compressed TIFFs without
+# imagecodecs; Open Confocal on such a file (e.g. an RGB overlay saved with LZW) raised
+# an error pyMap did not catch and closed pyFIB. 2024.6.1 is the last release built
+# before NumPy 2 (matches numpy 1.26.4) with a Python 3.9 Windows wheel.
+imagecodecs==2024.6.1
+readlif>=0.6.5,<0.7

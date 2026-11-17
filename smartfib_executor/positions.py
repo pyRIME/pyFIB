@@ -97,7 +97,26 @@ class PositionDatabase:
 
     @staticmethod
     def load(path: Path) -> "PositionDatabase":
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # v0.55.1 (#19): another pyFIB process may be replacing the file at this moment
+        # (Windows: PermissionError for an instant); retried briefly.
+        text = None
+        for _try in range(4):
+            try:
+                text = path.read_text(encoding="utf-8")
+                break
+            except PermissionError:
+                if _try == 3:
+                    raise
+                time.sleep(0.15)
+
+        # v0.55.1 (#20): NaN / Infinity are not stage positions. Python's JSON reader
+        # accepts them (and 1e999 as infinity). Below, a non-finite REQUIRED number
+        # (stage, objective, magnification) refuses the file; a non-finite optional
+        # reading loads as "not recorded", so an older file that holds one still opens.
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError(f"{path.name} is not a pyFIB positions file (top level is "
+                             f"{type(data).__name__}, expected an object)")
         found = data.get("schema")
         if found not in ACCEPTED_SCHEMAS:
             raise ValueError(
@@ -113,11 +132,26 @@ class PositionDatabase:
 
         def _f(rec, key):
             v = rec.get(key)
-            return float(v) if v is not None else None
+            if v is None:
+                return None
+            v = float(v)
+            return v if math.isfinite(v) else None       # optional: "not recorded"
+
+        def _fin(value, what):
+            """float(value), refused unless finite (v0.55.1, #20)."""
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{path.name}: {what} is {value!r}, not a number") from None
+            if not math.isfinite(v):
+                raise ValueError(f"{path.name}: {what} is {v!r}, not a finite number")
+            return v
 
         def _i(rec, key):
             v = rec.get(key)
-            return int(v) if v is not None else None
+            if v is None or (isinstance(v, float) and not math.isfinite(v)):
+                return None
+            return int(v)
 
         def _stage_images(v):
             if not isinstance(v, dict):
@@ -129,18 +163,22 @@ class PositionDatabase:
         for name, rec in pos_dict.items():
             st = rec["stage_at"]
             stage_at = StageAt(
-                x_m=float(st["x_m"]),
-                y_m=float(st["y_m"]),
-                z_m=float(st["z_m"]),
-                r_deg=float(st["r_deg"]),
-                m_m=float(st["m_m"]),
-                t_deg=float(st["t_deg"]) if st.get("t_deg") is not None else None,
+                x_m=_fin(st["x_m"], f"{name} stage X"),
+                y_m=_fin(st["y_m"], f"{name} stage Y"),
+                z_m=_fin(st["z_m"], f"{name} stage Z"),
+                r_deg=_fin(st["r_deg"], f"{name} stage R"),
+                m_m=_fin(st["m_m"], f"{name} stage M"),
+                t_deg=(_fin(st["t_deg"], f"{name} stage T")
+                       if st.get("t_deg") is not None else None),
             )
             db.positions[name] = PositionRecord(
                 name=str(rec["name"]),
-                captured_unix_s=float(rec["captured_unix_s"]),
-                fib_magnification_x=float(rec["fib_magnification_x"]),
-                fib_objective_potential_v=float(rec["fib_objective_potential_v"]),
+                captured_unix_s=(lambda c: c if math.isfinite(c) else 0.0)(
+                    float(rec["captured_unix_s"])),
+                fib_magnification_x=_fin(rec["fib_magnification_x"],
+                                         f"{name} FIB magnification"),
+                fib_objective_potential_v=_fin(rec["fib_objective_potential_v"],
+                                               f"{name} FIB objective voltage"),
                 stage_at=stage_at,
                 image_bmp=rec.get("image_bmp"),
                 notes=rec.get("notes"),
@@ -171,6 +209,29 @@ class PositionDatabase:
         positions_out: Dict[str, Any] = {}
         for name, rec in self.positions.items():
             d = asdict(rec)
+            # v0.55.1 (#20): a position whose stage / objective / magnification is not a
+            # finite number is never written; a non-finite OPTIONAL reading (a field of
+            # view, a recorded beam shift ...) is stored as "not recorded" (null).
+            st = d.get("stage_at") or {}
+            req = {f"stage {k}": st.get(k) for k in ("x_m", "y_m", "z_m", "r_deg", "m_m")}
+            req["FIB objective voltage"] = d.get("fib_objective_potential_v")
+            req["FIB magnification"] = d.get("fib_magnification_x")
+            if st.get("t_deg") is not None:
+                # a recorded tilt is never silently dropped: without it a recall holds
+                # the live tilt and the batch tilt limit does not see this position
+                req["stage t_deg"] = st.get("t_deg")
+            cu = d.get("captured_unix_s")
+            if not isinstance(cu, (int, float)) or not math.isfinite(float(cu)):
+                d["captured_unix_s"] = 0.0
+            bad = [f"{k}={v!r}" for k, v in req.items()
+                   if not isinstance(v, (int, float)) or not math.isfinite(float(v))]
+            if bad:
+                raise ValueError(f"position {name!r} not saved: {', '.join(bad)} is not a "
+                                 f"finite number")
+            for holder in (d, st):
+                for k, v in list(holder.items()):
+                    if isinstance(v, float) and not math.isfinite(v):
+                        holder[k] = None
             positions_out[name] = d
 
         out = {
@@ -181,9 +242,13 @@ class PositionDatabase:
         }
         # v0.51.0: atomic (temp file + replace). Batches now write the file after every
         # staged site; a stop or crash mid-write must never truncate the session.
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(out, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(str(tmp), str(path))
+        # v0.55.1 (#19): a temp name unique to this process and call (the window and a
+        # running batch can both save), the replace retried while Windows has the file
+        # locked, and the previous version kept as positions.json.prev. allow_nan=False:
+        # a non-finite number is never written (#20).
+        from .atomic_io import write_text_atomic
+        write_text_atomic(path, json.dumps(out, indent=2, sort_keys=True, allow_nan=False),
+                          backup=True)
 
     def upsert(self, record: PositionRecord) -> None:
         self.positions[record.name] = record
@@ -242,8 +307,8 @@ def capture_position(
     fiducial_number: Optional[int] = None, # numbered fiducial (1-30) milled on that side
     unfreeze_before_grab: bool = True,
     freeze_after_grab: bool = True,
-    frame_wait_s: float = 3.0,        # frame-safe grab: minimum live scan before freezing
-    frozen_timeout_s: float = 30.0,   # frame-safe grab: max wait for DP_FROZEN
+    frame_wait_s: float = 3.0,        # v0.54.0: only if DP_FROZEN is unreadable
+    frozen_timeout_s: float = 60.0,   # v0.54.0: wait for DP_FROZEN if AP_FRAME_TIME unreadable
     coarse_magnification_x: Optional[float] = None,   # e.g. 800: also grab a coarse ref
     coarse_scan_rate: Optional[int] = 5,              # scan rate for the coarse frame
 ) -> PositionRecord:
@@ -296,42 +361,28 @@ def capture_position(
         #   1) execute CMD_FIB_MODE_FIB if we're not already in "FIB"
         #   2) wait for DP_FIB_IMAGING to report "FIB" (string-first), with a numeric fallback.
 
-        def _fib_imaging_str() -> Optional[str]:
-            try:
-                return sem.get_str("DP_FIB_IMAGING").strip()
-            except Exception:
-                return None
+        # v0.54.0 (bug #14): the shared switch -- CMD_FIB_MODE_FIB only if not already
+        # in FIB imaging, then wait until SmartSEM's magnification reset has landed.
+        from .frame_grab import FibSwitchTimeout, ensure_fib_imaging
+        try:
+            ensure_fib_imaging(sem, timeout_s=float(fib_image_timeout_s), log=print)
+        except FibSwitchTimeout as e:
+            raise SmartSEMError(f"{e} Capture refused, nothing was saved.")
 
-        cur_s = _fib_imaging_str()
-        if cur_s is None or cur_s.upper() != "FIB":
-            sem.execute("CMD_FIB_MODE_FIB")
-
-        t0 = time.time()
-        last_s: Optional[str] = cur_s
-        last_num: Optional[float] = None
-
-        while True:
-            last_s = _fib_imaging_str()
-            if last_s is not None and last_s.upper() == "FIB":
-                break
-
-            # Numeric fallback (best-effort)
-            try:
-                last_num = float(sem.get_float("DP_FIB_IMAGING"))
-                if int(last_num) == 1:
-                    break
-            except Exception:
-                pass
-
-            if time.time() - t0 > float(fib_image_timeout_s):
-                raise SmartSEMError(
-                    "Timeout waiting for DP_FIB_IMAGING=FIB after CMD_FIB_MODE_FIB "
-                    f"(last_str={last_s!r}, last_num={last_num!r})."
-                )
-            time.sleep(0.25)
-
-    # 1) Set FIB magnification
-    sem.set_value("AP_FIB_MAGNIFICATION", float(fib_magnification_x))
+    # 1) Set FIB magnification -- and read it back (v0.53.4, Evan 2026-10-12). The
+    #    recorded pixel size comes from the REQUESTED magnification, so a set that did
+    #    not take would silently record a wrong-scale reference: refuse instead.
+    from .frame_grab import is_stale_warning, read_fib_mag, set_fib_mag_checked
+    fine_mag = float(fib_magnification_x)
+    mag_before = read_fib_mag(sem)
+    ok, mag_rb = set_fib_mag_checked(sem, fine_mag)
+    if not ok:
+        raise SmartSEMError(
+            f"FIB magnification reads {mag_rb}x after setting {fine_mag:g}x (set twice); "
+            f"capture refused, nothing was saved. Check SmartSEM's FIB magnification and "
+            f"capture again.")
+    print(f"[capture] FIB magnification {fine_mag:g}x (read back {mag_rb:g}x"
+          + (f"; was {mag_before:g}x" if mag_before is not None else "") + ")")
 
     if settle_s > 0:
         time.sleep(float(settle_s))
@@ -359,6 +410,17 @@ def capture_position(
                 w = grab_fresh_frame(sem, str(img_target), frame_wait_s=frame_wait_s,
                                      frozen_timeout_s=frozen_timeout_s, log=print,
                                      **grab_kw)
+                if is_stale_warning(w):
+                    # v0.53.4: the file is the PREVIOUS frame store -- never a reference.
+                    # v0.54.0: so is a frame that ended too soon or repeats the last grab.
+                    sus = img_target.with_name(img_target.stem + "_suspect.bmp")
+                    try:
+                        img_target.replace(sus)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise SmartSEMError(
+                        f"the {fine_mag:g}x frame is not a usable new frame ({w}) Kept as "
+                        f"{sus.name}; capture refused, nothing recorded. Capture again.")
                 if w:
                     notes = (notes + "\n" + w) if notes else w
             else:
@@ -373,6 +435,18 @@ def capture_position(
                 except Exception:
                     pass
             raise
+        # v0.53.4: the magnification must still be the one set when the frame ends.
+        post = read_fib_mag(sem)
+        if post is None or abs(post - fine_mag) > 0.01 * fine_mag:
+            sus = img_target.with_name(img_target.stem + "_suspect.bmp")
+            try:
+                img_target.replace(sus)
+            except Exception:  # noqa: BLE001
+                pass
+            raise SmartSEMError(
+                f"FIB magnification read {post}x after the frame, not {fine_mag:g}x; the "
+                f"image was kept as {sus.name} and the capture refused (nothing recorded). "
+                f"Capture again.")
         image_rel = str(img_target)
         # The frame-safe grab leaves the scan FROZEN (no further dose). Honour the
         # options: freeze_after_grab=False -> resume live scanning; the as-is path
@@ -405,24 +479,59 @@ def capture_position(
     image_coarse_rel: Optional[str] = None
     coarse_mag_rec: Optional[float] = None
     if image_bmp is not None and coarse_magnification_x:
-        from .frame_grab import grab_fresh_frame, read_scan_rate, set_scan_rate
+        from .frame_grab import (SCAN_RATE_SETTLE_S, grab_fresh_frame, read_scan_rate,
+                                 set_scan_rate)
         coarse_target = Path(image_bmp).with_name(Path(image_bmp).stem + "_coarse.bmp")
         prev_rate = read_scan_rate(sem) if coarse_scan_rate is not None else None
         try:
-            sem.set_value("AP_FIB_MAGNIFICATION", float(coarse_magnification_x))
-            if settle_s > 0:
-                time.sleep(float(settle_s))
-            if coarse_scan_rate is not None:
-                set_scan_rate(sem, int(coarse_scan_rate))
-            w = grab_fresh_frame(sem, str(coarse_target), frame_wait_s=frame_wait_s,
-                                 frozen_timeout_s=frozen_timeout_s, log=print,
-                                 xoff=grab_xoff, yoff=grab_yoff, width=grab_width,
-                                 height=grab_height, reduction=grab_reduction)
-            _recover_grab_file(sem, coarse_target)
-            if not coarse_target.exists():
-                raise RuntimeError(f"coarse grab produced no file at {coarse_target}")
+            cm = float(coarse_magnification_x)
+            fine_bytes = Path(image_bmp).read_bytes() if Path(image_bmp).exists() else None
+            for attempt in (1, 2):
+                # v0.53.4: magnification read back before the frame ...
+                ok_c, rb_c = set_fib_mag_checked(sem, cm)
+                if not ok_c:
+                    raise RuntimeError(f"FIB magnification reads {rb_c}x after setting "
+                                       f"{cm:g}x (set twice); no coarse frame taken")
+                print(f"[capture] coarse: FIB magnification {cm:g}x (read back {rb_c:g}x)"
+                      + (" -- retry" if attempt == 2 else ""))
+                if settle_s > 0:
+                    time.sleep(float(settle_s))
+                if coarse_scan_rate is not None:
+                    set_scan_rate(sem, int(coarse_scan_rate))
+                    # v0.54.0 review: let AP_FRAME_TIME follow the new speed before the
+                    # frame (the wait for Frozen is 2 x AP_FRAME_TIME).
+                    time.sleep(SCAN_RATE_SETTLE_S)
+                w = grab_fresh_frame(sem, str(coarse_target), frame_wait_s=frame_wait_s,
+                                     frozen_timeout_s=frozen_timeout_s, log=print,
+                                     xoff=grab_xoff, yoff=grab_yoff, width=grab_width,
+                                     height=grab_height, reduction=grab_reduction)
+                _recover_grab_file(sem, coarse_target)
+                if not coarse_target.exists():
+                    raise RuntimeError(f"coarse grab produced no file at {coarse_target}")
+                # ... and after it,
+                post_c = read_fib_mag(sem)
+                if post_c is None or abs(post_c - cm) > 0.01 * cm:
+                    raise RuntimeError(f"FIB magnification read {post_c}x after the coarse "
+                                       f"frame, not {cm:g}x")
+                # ... and the frame must be NEW: a byte copy of the fine frame means the
+                # scan never restarted (position_1, 2026-10-12).
+                stale = is_stale_warning(w) or (
+                    fine_bytes is not None and coarse_target.read_bytes() == fine_bytes)
+                if not stale:
+                    break
+                print(f"[capture] coarse frame is not a new frame (identical to the "
+                      f"{fine_mag:g}x image or the scan did not restart)"
+                      + ("; trying once more" if attempt == 1 else ""))
+                if attempt == 2:
+                    sus = coarse_target.with_name(coarse_target.stem + "_suspect.bmp")
+                    try:
+                        coarse_target.replace(sus)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise RuntimeError(f"the {cm:g}x frame was not a new frame twice (kept "
+                                       f"as {sus.name}); no coarse reference recorded")
             image_coarse_rel = str(coarse_target)
-            coarse_mag_rec = float(coarse_magnification_x)
+            coarse_mag_rec = cm
             if w:
                 notes = (notes + "\n" if notes else "") + "[coarse] " + w
         except Exception as e:  # noqa: BLE001
@@ -433,7 +542,12 @@ def capture_position(
             if prev_rate is not None:
                 set_scan_rate(sem, int(prev_rate))
             try:
-                sem.set_value("AP_FIB_MAGNIFICATION", float(fib_magnification_x))
+                ok_r, rb_r = set_fib_mag_checked(sem, fine_mag)
+                if not ok_r:
+                    w_r = (f"WARNING: FIB magnification reads {rb_r}x after restoring "
+                           f"{fine_mag:g}x")
+                    print(w_r)
+                    notes = (notes + "\n" if notes else "") + w_r
             except Exception:
                 pass
 
@@ -518,6 +632,23 @@ def capture_position(
         note_str = "v2: " + "; ".join(v2_notes)
         notes = (notes + "\n" + note_str) if notes else note_str
 
+    # v0.55.1 (#20): never record a position the stage could not be sent back to.
+    _req = {"stage X": x, "stage Y": y, "stage Z": z, "stage R": r, "stage M": m,
+            "FIB objective voltage": obj_v, "FIB magnification": fib_magnification_x}
+    if t is not None:
+        _req["stage T"] = t
+    _bad = []
+    for _k, _v in _req.items():
+        try:
+            if not math.isfinite(float(_v)):
+                _bad.append(f"{_k}={_v!r}")
+        except (TypeError, ValueError):
+            _bad.append(f"{_k}={_v!r}")
+    if _bad:
+        raise SmartSEMError(
+            f"capture refused: {', '.join(_bad)} did not read as a finite number. "
+            f"Nothing was recorded.")
+
     return PositionRecord(
         name=name,
         captured_unix_s=time.time(),
@@ -579,6 +710,26 @@ def recall_position(
     Note: Whether setting AP_STAGE_GOTO_* immediately initiates motion depends on
     microscope configuration. MoveStage() is generally the most explicit option.
     """
+
+    # v0.55.1 (#20, review): nothing is set or moved for a position whose recorded numbers
+    # are not finite (ap_goto wrote its GOTO targets before any check).
+    _st = record.stage_at
+    _chk = {"x_m": _st.x_m, "y_m": _st.y_m, "z_m": _st.z_m, "r_deg": _st.r_deg, "m_m": _st.m_m,
+            "objective": record.fib_objective_potential_v,
+            "magnification": record.fib_magnification_x}
+    if _st.t_deg is not None:
+        _chk["t_deg"] = _st.t_deg
+    _bad = []
+    for _k, _v in _chk.items():
+        try:
+            if not math.isfinite(float(_v)):
+                _bad.append(f"{_k}={_v!r}")
+        except (TypeError, ValueError):
+            _bad.append(f"{_k}={_v!r}")
+    if _bad:
+        raise SmartSEMError(
+            f"recall '{record.name}' refused: {', '.join(_bad)} is not a finite number. "
+            f"Nothing was set or moved.")
 
     if set_magnification:
         sem.set_value("AP_FIB_MAGNIFICATION", float(record.fib_magnification_x))

@@ -306,6 +306,10 @@ def _run_real(args) -> int:
                                   beam_sign_x=sx, beam_sign_y=sy,
                                   verify=not args.no_verify, logger=print)
     finally:
+        try:
+            scope.restore_scan_rate()      # v0.54.0: the speed is set once per sequence
+        except Exception:  # noqa: BLE001
+            pass
         sem.close()
     return _report(res)
 

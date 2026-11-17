@@ -29,7 +29,7 @@ from qtpy.QtCore import Signal
 
 from ..probes import PROBES, get_probe, probe_names_by_current
 from ..model import Exposure
-from .coords import layout_to_scene, scene_to_layout, scene_angle_to_layout
+from .coords import layout_to_scene, scene_to_layout, scene_angle_to_layout, layout_angle_to_scene
 from .items import ArcItem, PolygonItem, RectItem, TextItem
 from .widgets import EdgeSelector
 
@@ -200,7 +200,7 @@ class PropertiesPanel(QWidget):
             item.setPos(sx, sy)
             item.width = self.w.value()
             item.height = self.h.value()
-            item.setRotation(self.angle.value())
+            item.setRotation(layout_angle_to_scene(self.angle.value()))
             item.imaging = self.imaging.isChecked()
             item.ignored = self.ignored.isChecked()
             item.set_marked_edge_dir(self.marked_edge.direction())

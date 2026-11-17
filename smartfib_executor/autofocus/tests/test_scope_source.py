@@ -28,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 
 from .. import sources as _sources
+from ... import frame_grab as _frame_grab
 from ..search import autofocus
 from ..sources import ScopeImageSource, DEFAULT_BEAM_SHIFT_X_M
 
@@ -179,6 +180,8 @@ class MockSmartSEM:
             return "Frozen" if self.frozen else "Live"
         if mnemonic == "DP_IMAGE_MODE":
             return self.image_mode
+        if mnemonic == "DP_FREEZE_ON":              # v0.54.0: read back by frame_grab
+            return self.freeze_on
         raise KeyError(mnemonic)
 
     def get_float(self, mnemonic: str) -> float:
@@ -206,6 +209,8 @@ class MockSmartSEM:
             return 1.0 if self.frozen else 0.0
         if mnemonic == "DP_SCANRATE":
             return float(getattr(self, "scan_rate", 4))
+        if mnemonic == "AP_FRAME_TIME":             # v0.54.0: ms, like the instrument
+            return self.cycle_s * 1000.0
         raise KeyError(mnemonic)
 
     def set_value(self, mnemonic: str, value) -> None:
@@ -251,6 +256,7 @@ def _make(sem=None, **kw):
     sem = sem or MockSmartSEM(clock=clock)
     sem.clock = clock
     _sources.time = clock          # patch module-level time -> virtual
+    _frame_grab.time = clock       # v0.54.0: the single-frame protocol polls with it
     kw.setdefault("bounds", (16000.0, 17000.0))
     kw.setdefault("roi", (0, 0, 512, 384))
     return sem, ScopeImageSource(sem, **kw), clock
@@ -259,6 +265,7 @@ def _make(sem=None, **kw):
 def _restore_time():
     import time as _real_time
     _sources.time = _real_time
+    _frame_grab.time = _real_time
 
 
 def _mnemonics(sem):

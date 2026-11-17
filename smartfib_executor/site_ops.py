@@ -39,8 +39,14 @@ from .mill_stages import (STAGE_LABEL, check_stage, record_after_image,
 
 PUSH_WARN_DISTANCE_M = 150e-6      # push: warn if the stage is further than this from the site
 MANUAL_STATE = "manual_state.json"  # <session>/runs/: last align / push per position + stage
-GUARD_MOTION_S = 10.0               # not-milling window before goto / align that may move stage
-GUARD_S = 5.0                       # ... before push / align (beam shift only) / after image
+# v0.53.5 (Evan, 2026-10-13): the manual buttons of the Rough Mill / Prepolish / Polish
+# tabs -- Go to, Align, Push pattern, Record after image -- all watch for 3 s (were 10 s
+# for Go to / Align with stage moves, 5 s otherwise). These are button presses with the
+# operator at the scope; Evan accepts the small risk of a click landing in the gap between
+# two patterns of a running job. Batch interlocks are unchanged.
+MANUAL_GUARD_S = 3.0
+GUARD_MOTION_S = MANUAL_GUARD_S     # kept for callers/tests that name it
+GUARD_S = 5.0                       # other callers (CLEM overview, Mark targets): unchanged
 GUARD_POLL_S = 0.5
 
 
@@ -50,16 +56,18 @@ class SiteRefused(RuntimeError):
 
 def _milling_guard(sem, what: str, window_s: float = GUARD_S, *, log=print,
                    clock=time.monotonic, sleep=time.sleep) -> None:
-    """Refuse unless SmartSEM reads NOT milling for the whole window (read-only)."""
-    from .batch import _is_milling_active
+    """Refuse unless SmartSEM reads NOT milling for the whole window (read-only).
+    v0.53.5: the refusal names the flag that read as milling, and what it read."""
+    from . import batch as _batch
     window_s = max(0.0, float(window_s))
     if window_s > 0:
         log(f"[site] checking that SmartSEM is not milling ({window_s:g} s) ...")
     t0 = clock()
     while True:
-        if _is_milling_active(sem):
-            raise SiteRefused(f"{what} refused: SmartSEM indicates milling (or the milling "
-                              f"state cannot be read). Nothing was changed.")
+        active, why = _batch.milling_state(sem, snapshot_ok=True)   # bug #15
+        if active:
+            raise SiteRefused(f"{what} refused: SmartSEM indicates milling ({why}). "
+                              f"Nothing was changed.")
         if clock() - t0 >= window_s:
             return
         sleep(GUARD_POLL_S)
@@ -81,9 +89,8 @@ def _save_state(session_dir, state: dict, log) -> None:
     try:
         p = _state_path(session_dir)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
-        os.replace(str(tmp), str(p))
+        from .atomic_io import write_text_atomic        # v0.55.1 (#19)
+        write_text_atomic(p, json.dumps(state, indent=1))
     except Exception as e:  # noqa: BLE001
         log(f"*** WARNING: could not note this step for the report ({e}); the instrument "
             f"action itself is unaffected. ***")
@@ -102,7 +109,7 @@ def site_goto(sem, rec, *, move_method: str = "movestage", set_mag: bool = True,
     from .batch import _zero_fib_beam_shift
     from .positions import recall_position
     _milling_guard(sem, f"Go to {rec.name}",
-                   GUARD_MOTION_S if guard_s is None else guard_s, log=log)
+                   MANUAL_GUARD_S if guard_s is None else guard_s, log=log)
     t_rec = rec.stage_at.t_deg
     try:
         t_now = float(sem.get_float("AP_STAGE_AT_T"))
@@ -136,7 +143,7 @@ def site_align(sem, rec, stage: str, session_dir, cfg, *,
     if ref is None:
         raise SiteRefused(f"Align {rec.name} ({STAGE_LABEL[s]}): {why}. Nothing was changed.")
     if guard_s is None:
-        guard_s = GUARD_MOTION_S if getattr(cfg, "enable_stage", False) else GUARD_S
+        guard_s = MANUAL_GUARD_S
     _milling_guard(sem, f"Align {rec.name}", guard_s, log=log)
     log(f"[align] {rec.name} ({STAGE_LABEL[s]}): aligning to the {label}")
     fn = _refine_fn or run_refine_at_position
@@ -159,8 +166,8 @@ def site_push(sem, rec, stage: str, ely, session_dir, *, drop_dir, drop_name: st
     path, source, msg = resolve_stage_pattern(rec, s, ely, session_dir)
     if not Path(path).exists():
         raise SiteRefused(f"Push for {rec.name}: pattern not found: {path}")
-    _milling_guard(sem, f"Push pattern for {rec.name}", GUARD_S if guard_s is None else guard_s,
-                   log=log)
+    _milling_guard(sem, f"Push pattern for {rec.name}",
+                   MANUAL_GUARD_S if guard_s is None else guard_s, log=log)
     log(f"[push] {rec.name} ({STAGE_LABEL[s]}): {msg}")
     try:
         x, y = float(sem.get_float("AP_STAGE_AT_X")), float(sem.get_float("AP_STAGE_AT_Y"))
@@ -187,15 +194,19 @@ def site_after_image(sem, db, rec, stage: str, positions_file, *,
                      _grab_fn=None, guard_s: Optional[float] = None):
     """Grab + record this stage's after image. Returns (path or None, warning or None)."""
     from .after_image import grab_after_mill_image
-    from .batch import _is_milling_active
+    from . import batch as _batch
     s = check_stage(stage)
     pf = Path(positions_file)
     session = pf.parent
     _milling_guard(sem, f"Record after image for {rec.name}",
-                   GUARD_S if guard_s is None else guard_s, log=log)
+                   MANUAL_GUARD_S if guard_s is None else guard_s, log=log)
     grab = _grab_fn or grab_after_mill_image
+    # v0.53.1: back to the position's objective (what Go to set) before the frame.
     path, warn = grab(sem, rec, session / "images",
-                      milling_active=lambda: _is_milling_active(sem), log=log, stage=s)
+                      # bug #15: the operator's button -- a SmartFIB snapshot is not milling
+                      milling_active=lambda: _batch.milling_state(sem, snapshot_ok=True)[0],
+                      log=log, stage=s,
+                      objective_v=float(rec.fib_objective_potential_v))
     if path is not None:
         try:
             rel = record_after_image(pf, rec.name, s, path, db=db)

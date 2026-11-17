@@ -1,7 +1,9 @@
 from __future__ import annotations
 import sys
 from . import test_workflow, test_positions_schema, test_recall_arrival, test_capture_fresh_frame
-from . import test_after_image, test_tilt_guard, test_mill_stages
+from . import test_after_image, test_tilt_guard, test_mill_stages, test_clem
+from . import test_milling_state, test_single_frame, test_refine_speed
+from . import test_mill_safety
 if __name__ == "__main__":
     print("="*60); print("test_workflow"); print("="*60)
     rc1 = test_workflow._run_all()
@@ -17,4 +19,14 @@ if __name__ == "__main__":
     rc6 = test_tilt_guard._run_all()
     print("="*60); print("test_mill_stages"); print("="*60)
     rc7 = test_mill_stages._run_all()
-    sys.exit(rc1 or rc2 or rc3 or rc4 or rc5 or rc6 or rc7)
+    print("="*60); print("test_clem"); print("="*60)
+    rc8 = test_clem._run_all()
+    print("="*60); print("test_milling_state"); print("="*60)
+    rc9 = test_milling_state._run_all()
+    print("="*60); print("test_single_frame"); print("="*60)
+    rc10 = test_single_frame._run_all()
+    print("="*60); print("test_refine_speed"); print("="*60)
+    rc11 = test_refine_speed._run_all()
+    print("="*60); print("test_mill_safety"); print("="*60)
+    rc12 = test_mill_safety._run_all()
+    sys.exit(rc1 or rc2 or rc3 or rc4 or rc5 or rc6 or rc7 or rc8 or rc9 or rc10 or rc11 or rc12)

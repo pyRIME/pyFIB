@@ -321,16 +321,20 @@ class ShapeItemMixin:
 class RectItem(QGraphicsObject, ShapeItemMixin):
     """Editable rectangle. Position = anchor (layout x,y); rotation via Qt.
 
-    The rect is drawn centred on its origin with the model width/height so that
-    Qt's item rotation pivots about the anchor, matching how SmartFIB rotates a
-    box about its placement point.
+    The box is drawn from its anchor (local 0,0) by the signed width/height. Qt's
+    rotation pivots about the box CENTRE (the item's transform origin, kept at the
+    centre whenever the size changes) and turns counter-clockwise on screen for a
+    positive layout angle -- how SmartFIB places a rotated RECT (measured
+    2026-10-20; pyFIB patch 0.9.1+pyfib.1: this used to pivot about the anchor and
+    turn clockwise). pos() stays the UNROTATED anchor, which is what the file stores.
     """
 
     def __init__(self, width: float, height: float) -> None:
         QGraphicsObject.__init__(self)
         ShapeItemMixin.__init__(self)
-        self.width = float(width)
-        self.height = float(height)          # signed (SmartFIB convention)
+        self._w = float(width)
+        self._h = float(height)              # signed (SmartFIB convention)
+        self._sync_origin()
         self.imaging = False
         self.edge_sel_auto_scan_angle = True
         self.edge_sel_marked_edge: Optional[int] = None
@@ -341,6 +345,29 @@ class RectItem(QGraphicsObject, ShapeItemMixin):
             | QGraphicsItem.ItemIsMovable
             | QGraphicsItem.ItemSendsGeometryChanges
         )
+
+    # -- size: keep the rotation pivot at the box centre --------------------- #
+    @property
+    def width(self) -> float:
+        return self._w
+
+    @width.setter
+    def width(self, value: float) -> None:
+        self._w = float(value)
+        self._sync_origin()
+
+    @property
+    def height(self) -> float:
+        return self._h
+
+    @height.setter
+    def height(self, value: float) -> None:
+        self._h = float(value)
+        self._sync_origin()
+
+    def _sync_origin(self) -> None:
+        """Rotation pivot = box centre (local), as SmartFIB rotates a RECT."""
+        self.setTransformOriginPoint(QPointF(self._w / 2.0, -self._h / 2.0))
 
     # vertices in SmartFIB order, expressed in local (y-down) coords:
     # layout offset (dx,dy) from the anchor maps to local (dx, -dy).
@@ -681,9 +708,11 @@ def mirror_shape_model(shape: Shape, axis: str) -> Shape:
     (through the origin). ``axis='x'`` reflects vertically (y -> -y);
     ``axis='y'`` reflects horizontally (x -> -x).
 
-    Exact for polygons and axis-aligned rects/text/arcs; for a rotated rect the
-    anchor is reflected and the angle negated/adjusted (correct for the common
-    axis-aligned lamella case).
+    Exact for polygons, rects (rotated or not), text and arcs. A rect's box is
+    reflected and re-formed (top-left anchor, w>0, h<0) about the same centre, and
+    its angle negated (x) or set to 180-angle (y): with SmartFIB's rotation about
+    the box centre both give the exact mirror image of the footprint (pyFIB patch
+    0.9.1+pyfib.1; with the old anchor pivot this was only right at 0 deg).
     """
     import copy as _copy
     s = _copy.deepcopy(shape)
@@ -720,8 +749,10 @@ def mirror_shape_model(shape: Shape, axis: str) -> Shape:
 def layout_bbox(shape: Shape):
     """Axis-aligned bounding box of a model shape in layout um: (x0,y0,x1,y1)."""
     if isinstance(shape, Rect):
-        xs = [shape.x, shape.x + shape.width]
-        ys = [shape.y, shape.y + shape.height]
+        from ..geometry import rect_corners
+        pts = rect_corners(shape.x, shape.y, shape.width, shape.height, shape.angle_deg)
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
     elif isinstance(shape, Polygon):
         xs = [p[0] for p in shape.points] or [0.0]
         ys = [p[1] for p in shape.points] or [0.0]

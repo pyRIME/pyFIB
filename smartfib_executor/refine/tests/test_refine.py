@@ -416,6 +416,8 @@ class _FakeGrabSem:
             return "FIB"
         if m == "DP_FROZEN":
             return "Frozen" if self.frozen else "Live"
+        if m == "DP_FREEZE_ON":                     # v0.54.0: read back by frame_grab
+            return self.freeze_on
         raise KeyError(m)
     def set_value(self, m, v):
         self.calls.append(("set", m, v))
@@ -433,9 +435,12 @@ class _FakeGrabSem:
             self.scan_rate = int(c.replace("CMD_SCANRATE", ""))
     def grab_bmp(self, path, *, xoff=0, yoff=0, width=64, height=48, reduction=0):
         self.rate_at_grab = self.scan_rate      # capture the rate in effect now
+        self.n_grabs = getattr(self, "n_grabs", 0) + 1
         try:
             from PIL import Image
-            Image.new("L", (width, height), 128).save(path)
+            im = Image.new("L", (width, height), 128)
+            im.putpixel((0, 0), self.n_grabs % 256)   # a new frame differs (shot noise)
+            im.save(path)
         except Exception:
             pass
 
@@ -457,11 +462,18 @@ def test_adapter_raises_scan_rate_for_grab_then_restores():
                             grab_size=(64, 48), imaging_scan_rate=8,
                             scan_rate_method="cmd", frozen_timeout_s=1.0)
     ad.grab_fib_image(2000.0)
-    # The rate was 8 AT THE MOMENT OF THE GRAB, and restored to 4 afterwards.
+    # The rate was 8 AT THE MOMENT OF THE GRAB ...
     assert sem.rate_at_grab == 8, sem.rate_at_grab
+    # ... v0.54.0: and it is set ONCE per refine sequence: a second frame sends nothing,
+    # restore_scan_rate() (run_refine_at_position's finally) puts 4 back.
+    ad.grab_fib_image(2000.0)
+    assert [c for c in sem.calls if c == ("exec", "CMD_SCANRATE8")] == [("exec", "CMD_SCANRATE8")]
+    assert sem.scan_rate == 8
+    ad.restore_scan_rate()
     assert sem.scan_rate == 4, sem.scan_rate
+    ad.restore_scan_rate()                       # idempotent
+    assert [c for c in sem.calls if c == ("exec", "CMD_SCANRATE4")] == [("exec", "CMD_SCANRATE4")]
     # Used CMD_SCANRATE (not a direct set) and the end-of-frame freeze sequence.
-    assert any(c == ("exec", "CMD_SCANRATE8") for c in sem.calls)
     assert ("exec", "CMD_UNFREEZE_ZONE") in sem.calls
     assert any(c == ("set", "DP_FREEZE_ON", "End Frame") for c in sem.calls)
 
@@ -478,6 +490,7 @@ def test_adapter_scan_rate_set_then_cmd_recovers_from_readonly():
     ad.grab_fib_image(2000.0)
     assert sem.rate_at_grab == 8
     assert any(c == ("exec", "CMD_SCANRATE8") for c in sem.calls)
+    ad.restore_scan_rate()
     assert sem.scan_rate == 4  # restored
 
 
@@ -486,18 +499,24 @@ class _PostMillFIB:
     """Mag lowered by milling; a set only sticks once in FIB imaging mode."""
     def __init__(self):
         self.mag = 500.0; self.imaging = False; self.mag_at_grab = []
+        self.frozen = True; self.freeze_on = "End Frame"
     def set_value(self, m, v):
         if m == "AP_FIB_MAGNIFICATION" and self.imaging: self.mag = float(v)
+        if m == "DP_FREEZE_ON": self.freeze_on = str(v)
     def get_float(self, m):
         return {"AP_FIB_MAGNIFICATION": self.mag,
                 "DP_FIB_IMAGING": 1.0 if self.imaging else 0.0,
-                "DP_FROZEN": 1.0, "DP_SCANRATE": 8.0, "AP_FIB_SCAN_ROTATION": 0.0}.get(m, 0.0)
+                "DP_FROZEN": 1.0 if self.frozen else 0.0, "DP_SCANRATE": 8.0,
+                "AP_FIB_SCAN_ROTATION": 0.0}.get(m, 0.0)
     def get_str(self, m):
         if m == "DP_FIB_IMAGING": return "FIB" if self.imaging else "SEM"
-        if m == "DP_FROZEN": return "Frozen"
+        if m == "DP_FROZEN": return "Frozen" if self.frozen else "Live"
+        if m == "DP_FREEZE_ON": return self.freeze_on
         return ""
     def execute(self, c):
         if c == "CMD_FIB_MODE_FIB": self.imaging = True
+        if c == "CMD_UNFREEZE_ZONE": self.frozen = False
+        if c in ("CMD_FREEZE_ZONE", "CMD_FREEZE_ALL"): self.frozen = True
     def grab_bmp(self, path, **k):
         self.mag_at_grab.append(self.mag)
         from PIL import Image; Image.new("L", (64, 48), 100).save(path)

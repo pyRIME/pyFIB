@@ -104,7 +104,10 @@ def test_shared_fov_matches_refine_geometry():
 class _CapSem:
     def __init__(self, fail=()):
         self.fail = set(fail)
-    def set_value(self, m, v): pass
+        self.mag = 52.0                    # v0.53.4: magnification is read back
+    def set_value(self, m, v):
+        if m == "AP_FIB_MAGNIFICATION":
+            self.mag = float(v)
     def execute(self, c): pass
     def get_str(self, m): return ""
     def grab_bmp(self, path, **k):
@@ -112,6 +115,8 @@ class _CapSem:
     def get_float(self, m):
         if m in self.fail:
             raise RuntimeError("unavailable")
+        if m == "AP_FIB_MAGNIFICATION":
+            return self.mag
         return {"AP_STAGE_AT_X": 1e-3, "AP_STAGE_AT_Y": 2e-3, "AP_STAGE_AT_Z": 3e-3,
                 "AP_STAGE_AT_R": 0.0, "AP_STAGE_AT_M": 0.0, "AP_STAGE_AT_T": 0.0,
                 "AP_FIB_OBJECTIVE_POTENTIAL": 16400.0, "AP_FIB_WORKING_DISTANCE": 4.98e-3,

@@ -24,6 +24,20 @@ from qtpy.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+# Milling-complete confirmation window on the Rough Mill / Prepolish / Polish tabs
+# (v0.52.2; passed as --done-confirm-s; the CLI's own default stays 30 s).
+DONE_CONFIRM_DEFAULT_S = 20
+DONE_CONFIRM_MIN_S = 10
+DONE_CONFIRM_MAX_S = 120
+
+# Mill timeout per site on the same tabs (v0.55.1, bug #21; passed as --timeout in
+# seconds). Before, the tabs never passed it and the CLI's 90 min applied; the CLI's own
+# default is unchanged. 240 min: Evan's rough waffle sites ran about 49 min (2026-10-15),
+# and a waffle pattern with 100 / 50 / 20 pA steps is estimated at about 140 min.
+MILL_TIMEOUT_DEFAULT_MIN = 240
+MILL_TIMEOUT_MIN_MIN = 10
+MILL_TIMEOUT_MAX_MIN = 1440
+
 
 def _title(text: str) -> QLabel:
     lab = QLabel(text)
@@ -53,21 +67,31 @@ class ArmBar(QWidget):
     commands run as the CLI's dry-run; armed, they pass --arm and execute for real.
     """
 
-    def __init__(self, on_change=None, on_new_session=None):
+    def __init__(self, on_change=None, on_new_session=None, *, brand=None,
+                 arm_in_bar: bool = True):
+        """v0.54.2: ``brand`` (the logo) is shown at the left of the bar; with
+        ``arm_in_bar=False`` the ARM button is created and wired here as always but the
+        window places it (bottom of the nav bar), and its text uses two lines."""
         super().__init__()
         self.setObjectName("armBar")
         self._on_new_session = on_new_session
+        self._two_line = not arm_in_bar
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 8)
         lay.setSpacing(10)
 
+        if brand is not None:
+            lay.addWidget(brand)
         self.arm_btn = QPushButton("ARM  (dry-run)")
         self.arm_btn.setCheckable(True)
         self.arm_btn.setObjectName("armButton")
         self.arm_btn.setMinimumWidth(160)
+        if self._two_line:
+            self.arm_btn.setMinimumHeight(58)
         self.arm_btn.toggled.connect(self._on_toggle)
         self._apply_arm_style(False)
-        lay.addWidget(self.arm_btn)
+        if arm_in_bar:
+            lay.addWidget(self.arm_btn)
 
         lay.addSpacing(16)
         lay.addWidget(QLabel("Positions file:"))
@@ -105,13 +129,14 @@ class ArmBar(QWidget):
         self.session_lbl.setText(Path(p).resolve().parent.name if p else "")
 
     def _apply_arm_style(self, armed: bool) -> None:
+        sep = "\n" if getattr(self, "_two_line", False) else "  "
         if armed:
-            self.arm_btn.setText("ARMED  (instrument live)")
+            self.arm_btn.setText(f"ARMED{sep}(instrument live)")
             self.arm_btn.setStyleSheet(
                 "QPushButton { background:#5a1a14; color:#ffe9e6; border:1px solid "
                 "#e0574a; border-radius:6px; padding:6px 12px; font-weight:700; }")
         else:
-            self.arm_btn.setText("ARM  (dry-run)")
+            self.arm_btn.setText(f"ARM{sep}(dry-run)")
             self.arm_btn.setStyleSheet(
                 "QPushButton { border:1px solid #3a4150; border-radius:6px; "
                 "padding:6px 12px; }")
@@ -412,7 +437,14 @@ class ElymakerTab(QWidget):
     open_handoff(...) so a pattern is authored over the right image at the right pixel
     size; elymaker writes the .ely + a ready-marker, which pyFIB picks up to link the
     pattern to its position (wiring TBD -- see the handoff questions).
+
+    v0.53.2 (Evan, 2026-10-12): selecting a shape grew the maximised pyFIB window past
+    the screen. Now: the right-hand dock panels scroll, the embedded window's minimum
+    size no longer reaches pyFIB, and "Open in own window" moves ELYMaker (with
+    everything in it) into its own window -- closing that window brings it back.
     """
+
+    SCROLL_DOCKS = ("dock_tools", "dock_properties", "dock_defaults")
 
     def __init__(self, window):
         super().__init__()
@@ -420,10 +452,26 @@ class ElymakerTab(QWidget):
         self._ewin = None
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(6, 2, 6, 0)
+        bar.addStretch(1)
+        self.detach_btn = QPushButton("Open in own window")
+        self.detach_btn.setToolTip("Move ELYMaker into its own window (e.g. a second "
+                                   "monitor, maximised). Close that window to bring it "
+                                   "back here; nothing in it is lost.")
+        self.detach_btn.clicked.connect(self.detach)
+        self.detach_btn.setEnabled(False)
+        bar.addWidget(self.detach_btn)
+        self._lay.addLayout(bar)
         self._status = QLabel("Opening ELYMaker…")
         self._status.setAlignment(Qt.AlignCenter)
         self._status.setStyleSheet("color:#9aa3b2;")
         self._lay.addWidget(self._status)
+        from .embedding import Detachable
+        self.host = Detachable("ELYMaker (pyFIB)", self._lay,
+                               "ELYMaker is open in its own window.")
+        self.host.listeners.append(
+            lambda on: self.detach_btn.setEnabled(not on and self._ewin is not None))
 
     def ensure_built(self) -> None:
         if self._ewin is not None:
@@ -438,8 +486,29 @@ class ElymakerTab(QWidget):
         except Exception as e:  # pragma: no cover
             self._status.setText(f"Could not start ELYMaker: {e}")
             return
+        from .embedding import contain, scroll_docks, share_dock_column
+        scroll_docks(self._ewin, self.SCROLL_DOCKS)
+        # Properties and New-shape defaults share one slot as tabs below Tools, so
+        # each gets real height; selecting a shape brings Properties to the front.
+        sel = getattr(getattr(self._ewin, "scene", None), "selectionChanged", None)
+        share_dock_column(self._ewin, "dock_tools", ("dock_properties", "dock_defaults"),
+                          upper_frac=0.45, raise_on_selection=sel)
+        contain(self._ewin)
         self._status.hide()
-        self._lay.addWidget(self._ewin)   # QMainWindow embeds as the tab body
+        self._lay.addWidget(self._ewin, 1)   # QMainWindow embeds as the tab body
+        self.host.set_widget(self._ewin)
+        self.detach_btn.setEnabled(True)
+
+    @property
+    def detached(self) -> bool:
+        return self.host.detached
+
+    def detach(self) -> None:
+        self.ensure_built()
+        self.host.detach()
+
+    def raise_window(self) -> None:
+        self.host.raise_window()
 
     def open_handoff(self, **kwargs) -> None:
         """Preload a position's image + geometry into elymaker (image_path,
@@ -450,6 +519,7 @@ class ElymakerTab(QWidget):
                 self._ewin.open_handoff(**kwargs)
             except Exception as e:  # noqa: BLE001
                 self._win.status(f"ELYMaker handoff failed: {e}")
+            self.host.raise_window()
 
 
 class GisdepTab(QWidget):
@@ -479,6 +549,15 @@ class GisdepTab(QWidget):
     def ensure_built(self) -> None:
         if self._gwin is not None:
             return
+        # v0.55.1 (#18): never open GISDEP's connection while a pyFIB command holds one.
+        # (Before, the one-client check refused it and the tab silently came up on the
+        # MOCK for the rest of the session.) It opens when the command has finished.
+        if getattr(self._win, "_cmd_active", False):
+            self._status.setText("A pyFIB command is running.\nThe GISDEP tab opens when "
+                                 "it has finished.")
+            self._status.show()
+            return
+        self._status.setText("Opening the GISDEP interface…")
         try:
             from gisdep.gui.app import GisdepWindow
         except Exception as e:  # pragma: no cover
@@ -492,7 +571,8 @@ class GisdepTab(QWidget):
         try:
             from ..smartsem_com import SmartSEM
             from ..gisdep_adapter import bridged_api
-            gwin = GisdepWindow(api=bridged_api(SmartSEM()))
+            # v0.53.3: check once for another SmartSEM client; never wait in the GUI.
+            gwin = GisdepWindow(api=bridged_api(SmartSEM(client_wait_s=0.0)))
             self._win.status("GISDEP: connected via pyFIB.")
         except Exception:
             try:
@@ -510,6 +590,58 @@ class GisdepTab(QWidget):
         # Reconcile ARM: pyFIB's global ARM toggle governs the gisdep tab too, so
         # gisdep's own ARM button is hidden and its arm state is driven from pyFIB.
         self.sync_arm()
+
+    def show_waiting(self, text: str) -> None:
+        if self._gwin is None:
+            self._status.setText(text)
+            self._status.show()
+
+    # --- v0.55.1 (#18): GISDEP's live-state timer and pyFIB's own commands -------------
+    def set_polling(self, on: bool) -> None:
+        """Run / pause gisdep's live-state timer (it reads needles, valves, stage and WD
+        from the microscope every 150 ms on the GUI thread). pyFIB pauses it whenever
+        the tab is not shown and while a pyFIB command runs, so the window sends nothing
+        to SmartSEM during a batch. Never raises."""
+        gw = self._gwin
+        t = getattr(gw, "_timer", None) if gw is not None else None
+        if t is None:
+            return
+        try:
+            if on and not t.isActive():
+                t.start()                     # gisdep's own interval
+            elif not on and t.isActive():
+                t.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def polling(self) -> bool:
+        t = getattr(self._gwin, "_timer", None) if self._gwin is not None else None
+        try:
+            return bool(t is not None and t.isActive())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def set_blocked(self, blocked: bool) -> None:
+        """Grey out the whole GISDEP panel while a pyFIB command runs: two programs must
+        never drive the stage, the needles or the beam at the same time."""
+        gw = self._gwin
+        if gw is None:
+            return
+        try:
+            gw.setEnabled(not blocked)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def shutdown(self) -> None:
+        """pyFIB is closing: stop the timer and release GISDEP's SmartSEM connection
+        (ClosingControl, the call every pyFIB command already ends with). Best effort."""
+        self.set_polling(False)
+        api = getattr(self._gwin, "api", None) if self._gwin is not None else None
+        try:
+            if api is not None and hasattr(api, "close"):
+                api.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def sync_arm(self) -> None:
         """Drive gisdep's arm state from pyFIB's global ARM toggle; hide gisdep's
@@ -807,10 +939,54 @@ class MillPage(QWidget):
         # instrument (2026-10-01); MoveStage moved it.
         self.move_combo.addItems(["movestage", "ap_goto", "none"])
         orow.addWidget(self.move_combo)
-        orow.addWidget(QLabel("Imaging scan rate:"))
+        # v0.54.0: refine has its own scan speed (Prepolish / Polish 3 with an automatic
+        # speed-8 retry, Evan 2026-10-16); this one is the autofocus speed.
+        orow.addWidget(QLabel("AF scan rate:"))
         self.scan_spin = QSpinBox(); self.scan_spin.setRange(-1, 15)
         self.scan_spin.setValue(8)
+        self.scan_spin.setToolTip("Scan speed for autofocus frames (-1 = as set in SmartSEM).")
         orow.addWidget(self.scan_spin)
+        from ..milling_workflow import refine_scan_rates
+        _rf_rate, _rf_fb = refine_scan_rates(stage, 8)
+        orow.addWidget(QLabel("Refine scan rate:"))
+        self.refine_scan_spin = QSpinBox(); self.refine_scan_spin.setRange(-1, 15)
+        self.refine_scan_spin.setValue(_rf_rate if _rf_rate is not None else 8)
+        self.refine_scan_spin.setToolTip(
+            "Scan speed for refine (align) frames (-1 = as set in SmartSEM)."
+            + (f" If the 2000x refine cannot correlate it is retried once at speed "
+               f"{_rf_fb} before the 800x fallback." if _rf_fb is not None else ""))
+        orow.addWidget(self.refine_scan_spin)
+        # v0.52.2: milling-complete confirmation window (CLI --done-confirm-s, CLI default
+        # 30 s). UI default 20 s (Evan, 2026-10-09). Floor 10 s: the window guards against
+        # brief "done" readings during probe changes between pattern parts; a false
+        # "done" ends the wait while the pattern is still running.
+        orow.addWidget(QLabel("Confirm done (s):"))
+        self.done_confirm_spin = QSpinBox()
+        self.done_confirm_spin.setRange(DONE_CONFIRM_MIN_S, DONE_CONFIRM_MAX_S)
+        self.done_confirm_spin.setValue(DONE_CONFIRM_DEFAULT_S)
+        self.done_confirm_spin.setToolTip(
+            "After SmartSEM first reads 'milling finished', it must keep reading finished "
+            "for this many seconds before the site counts as done (then the after image, "
+            "beam shift reset and the move to the next site). Guards against brief "
+            "'finished' readings during probe changes between pattern parts. If the Log "
+            f"shows 'Completion not stable after N s', N must stay well below this value. "
+            f"Range {DONE_CONFIRM_MIN_S}-{DONE_CONFIRM_MAX_S} s; default "
+            f"{DONE_CONFIRM_DEFAULT_S} s.")
+        orow.addWidget(self.done_confirm_spin)
+        # v0.55.1 (#21): how long one site may mill before it is given up as an error.
+        orow.addWidget(QLabel("Mill timeout (min):"))
+        self.mill_timeout_spin = QSpinBox()
+        self.mill_timeout_spin.setRange(MILL_TIMEOUT_MIN_MIN, MILL_TIMEOUT_MAX_MIN)
+        self.mill_timeout_spin.setSingleStep(10)
+        self.mill_timeout_spin.setValue(MILL_TIMEOUT_DEFAULT_MIN)
+        self.mill_timeout_spin.setToolTip(
+            "The longest one site may take to mill. Set it well above the time SmartFIB "
+            "shows for the pattern. A site that mills longer ends as an error: pyFIB does "
+            "NOT stop the pattern and does not reset the beam shift while SmartSEM still "
+            "indicates milling; the next site waits until milling has stopped. "
+            f"Range {MILL_TIMEOUT_MIN_MIN}-{MILL_TIMEOUT_MAX_MIN} min; default "
+            f"{MILL_TIMEOUT_DEFAULT_MIN} min (it was fixed at 90 min before v0.55.1).")
+        orow.addWidget(self.mill_timeout_spin)
         self.continue_chk = QCheckBox("Continue on error")
         orow.addWidget(self.continue_chk)
         orow.addStretch(1)
@@ -1072,8 +1248,11 @@ class MillPage(QWidget):
         args = ["mill-positions", ely, *mill_names, "--positions-file", pos_file,
                 "--stage", self.stage,
                 "--wait", self.wait_combo.currentText(),
+                "--done-confirm-s", str(self.done_confirm_spin.value()),
+                "--timeout", str(int(self.mill_timeout_spin.value()) * 60),
                 "--move-method", self.move_combo.currentText(),
-                "--imaging-scan-rate", str(self.scan_spin.value())]
+                "--imaging-scan-rate", str(self.scan_spin.value()),
+                "--refine-scan-rate", str(self.refine_scan_spin.value())]
         af = [n for n in self._checked_names(self.C_AF) if n in mill_names]
         rf = [n for n in self._checked_names(self.C_REFINE) if n in mill_names]
         if af:
@@ -1149,13 +1328,30 @@ class MillPage(QWidget):
             self._win.run_cli(args, on_line=self._on_mill_line,
                               on_done=lambda rc: self.refresh_stage_columns())
             return
-        # v0.46.0 batch tilt limit: a read-only --tilt-check first (no --arm), then an OK
-        # for any position that will NOT be milled, then the armed run with exactly that
-        # list in --accept-tilt-skips (the run refuses if anything else is out of range).
+        # v0.53.3: ONE connection per Start. The armed run checks the 2-degree batch tilt
+        # limit itself on its own connection, before any motion. If positions are out of
+        # range it stops (exit 3, nothing moved) and prints the TILT-CHECK line; we ask,
+        # and only then start it again with --accept-tilt-skips. (v0.46.0-v0.53.2 ran a
+        # separate --tilt-check process first: two SmartSEM connections a second apart,
+        # which crashed the second one in the ZEISS API on 2026-10-12.)
         self._tilt = None
-        check = [a for a in args if a != "--arm"] + ["--tilt-check"]
-        self._win.run_cli(check, on_line=self._on_tilt_line,
-                          on_done=lambda rc, a=list(args): self._after_tilt_check(rc, a))
+        self._tilt_refused = False
+        self._win.run_cli(args, on_line=self._on_armed_line,
+                          on_done=lambda rc, a=list(args): self._after_armed(rc, a))
+
+    def _on_armed_line(self, line: str) -> None:
+        self._on_tilt_line(line)
+        if line.strip().startswith("[tilt] Refusing:"):
+            self._tilt_refused = True
+        self._on_mill_line(line)
+
+    def _after_armed(self, rc: int, args: list) -> None:
+        t = getattr(self, "_tilt", None)
+        if rc == 3 and self._tilt_refused and t is not None and t["excluded"] \
+                and t["allowed"] and "--accept-tilt-skips" not in args:
+            self._after_tilt_check(0, args)        # ask, then run with the skips
+            return
+        self.refresh_stage_columns()
 
     def _on_tilt_line(self, line: str) -> None:
         from ..tilt_guard import parse_machine_line
@@ -1236,7 +1432,7 @@ class MillPage(QWidget):
         if action == "goto":
             args += ["--move-method", self.move_combo.currentText()]
         elif action == "align":
-            args += ["--imaging-scan-rate", str(self.scan_spin.value())]
+            args += ["--refine-scan-rate", str(self.refine_scan_spin.value())]
             if self.refine_stage_chk.isChecked():
                 args += ["--refine-enable-stage"]
         elif action == "push":
@@ -1505,16 +1701,27 @@ class PositionsPage(QWidget):
             # v0.51.0: link on a FRESH copy -- a batch may have recorded after images in
             # positions.json since this page loaded it; saving the old copy would drop them.
             self._db = PositionDatabase.load(Path(pf))
+            before = {n: getattr(r, "ely_pattern", None)
+                      for n, r in self._db.positions.items()}
             summary = link_patterns_to_positions(self._db, pf)
         except Exception as exc:  # noqa: BLE001
             if not quiet:
                 self._win.status(f"Pattern refresh failed: {exc}")
             return
-        if summary["linked"]:
+        # v0.55.1 (#19): save only when a link really CHANGED. Before, every look at this
+        # tab re-saved positions.json once the session had one authored pattern -- also
+        # while a batch was writing after images into the same file.
+        changed = [n for n in summary["linked"]
+                   if getattr(self._db.positions.get(n), "ely_pattern", None) != before.get(n)]
+        if changed:
             try:
                 self._db.save(Path(pf))   # persist ely_pattern links
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                lp = getattr(self._win, "log_page", None)
+                if lp is not None:
+                    lp.append(f"[positions] could not save the pattern links "
+                              f"({type(exc).__name__}: {exc}); press Refresh patterns to "
+                              f"try again")
         if not quiet:
             msg = f"Linked {len(summary['linked'])} pattern(s)."
             if summary["stale"]:
